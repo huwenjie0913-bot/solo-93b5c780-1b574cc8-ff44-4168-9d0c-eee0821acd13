@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>巡检路线打印 - {{ plan.name }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<style>
+  body { overflow: auto; background: #fff; }
+</style>
+</head>
+<body class="print-body">
+<div class="print-actions no-print">
+  <button class="btn primary" onclick="window.print()">🖨 打印 / 导出 PDF</button>
+  <a class="btn" href="/">返回编排器</a>
+</div>
+
+<div class="print-head">
+  <div>
+    <h1>厂房巡检路线图 — {{ plan.name }}</h1>
+    <div class="print-meta" id="meta"></div>
+  </div>
+</div>
+
+<canvas id="printCanvas"></canvas>
+
+<h3 style="margin-top:18px">行走次序表</h3>
+<table class="print-table" id="seqTable">
+  <thead><tr>
+    <th>次序</th><th>点号</th><th>类型</th><th>到下一点距离 (m)</th>
+    <th>到下一点用时 (分)</th><th>状态</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<script>
+const PLAN = {{ plan.data | tojson }};
+const ROUTE = {{ (plan.route or {}) | tojson }};
+</script>
+<script>
+(function () {
+  const cv = document.getElementById("printCanvas");
+  const ctx = cv.getContext("2d");
+  const W = PLAN.image?.width || 1600;
+  const H = PLAN.image?.height || 1000;
+  const scale = Math.min(1, 1060 / W);
+  cv.width = W * scale; cv.height = H * scale;
+  cv.style.width = "100%";
+  ctx.scale(scale, scale);
+
+  function line(x1, y1, x2, y2, c, w) {
+    ctx.strokeStyle = c; ctx.lineWidth = w;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+
+  // 底图
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H);
+  const img = new Image();
+  img.onload = drawAll;
+  if (PLAN.image?.url) img.src = PLAN.image.url; else drawAll();
+
+  function drawAll() {
+    try { if (img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, W, H); } catch (e) {}
+
+    // 未覆盖
+    if (ROUTE.coverage?.uncoveredRuns?.length && ROUTE.gridInfo) {
+      const { gw } = ROUTE.gridInfo;
+      const cell = W / gw;
+      ctx.fillStyle = "rgba(245,158,11,.28)";
+      for (const [start, len] of ROUTE.coverage.uncoveredRuns) {
+        for (let i = 0; i < len; i++) {
+          const idx = start + i;
+          ctx.fillRect((idx % gw) * cell, ((idx / gw) | 0) * cell, cell + .5, cell + .5);
+        }
+      }
+    }
+
+    // 禁入区
+    for (const z of PLAN.zones || []) {
+      ctx.beginPath();
+      ctx.moveTo(z.points[0].x, z.points[0].y);
+      for (let i = 1; i < z.points.length; i++) ctx.lineTo(z.points[i].x, z.points[i].y);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(220,38,38,.10)"; ctx.fill();
+      ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 2;
+      ctx.setLineDash([8, 5]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    // 墙 / 窗 / 门
+    for (const w of PLAN.windows || []) line(w.x1, w.y1, w.x2, w.y2, "#0ea5e9", w.thickness || 5);
+    for (const w of PLAN.walls || []) line(w.x1, w.y1, w.x2, w.y2, "#374151", w.thickness || 4);
+    for (const d of PLAN.doors || []) {
+      line(d.x1, d.y1, d.x2, d.y2, d.open === false ? "#dc2626" : "#16a34a", 4);
+    }
+
+    // 路线
+    for (const s of ROUTE.segments || []) {
+      if (s.blocked) {
+        const f = s.fallbackPath;
+        ctx.setLineDash([9, 7]);
+        line(f[0].x, f[0].y, f[1].x, f[1].y, "#dc2626", 3);
+        ctx.setLineDash([]);
+      } else {
+        const pts = s.path;
+        ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 4;
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+      }
+    }
+
+    // 点位编号
+    for (const p of ROUTE.points || []) {
+      let col = "#2563eb", fill = "#fff", r = 7;
+      if (p.kind === "start") { col = "#16a34a"; fill = col; r = 10; }
+      if (p.kind === "end") { col = "#dc2626"; fill = col; r = 10; }
+      if (p.kind === "must") { col = "#f59e0b"; fill = col; r = 9; }
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = fill; ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.fillStyle = col; ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(p.seq, p.x, p.y - r - 5);
+    }
+    fillTable();
+  }
+
+  function fillTable() {
+    const s = ROUTE.stats || {};
+    document.getElementById("meta").innerHTML = `
+      <span>总里程 <b>${s.totalLengthM ?? "—"} m</b></span>
+      <span>预计用时 <b>${s.etaMinutes ?? "—"} 分钟</b></span>
+      <span>巡检点 <b>${s.pointCount ?? 0}</b></span>
+      <span>覆盖率 <b>${ROUTE.coverage?.percent ?? "—"}%</b></span>
+      <span>未覆盖 <b>${ROUTE.coverage?.uncoveredAreaM2 ?? "—"} m²</b></span>
+      <span>受阻路段 <b>${s.blockedCount ?? 0}</b></span>
+      <span>生成时间 ${new Date().toLocaleString("zh-CN")}</span>`;
+
+    const typeName = { start: "起点", end: "终点", must: "必经点", auto: "巡检点" };
+    const tb = document.querySelector("#seqTable tbody");
+    const speed = s.walkSpeedMps || 1.2;
+    let html = "";
+    const segs = ROUTE.segments || [];
+    for (const p of ROUTE.points || []) {
+      const seg = segs.find((x) => x.from === p.id);
+      html += `<tr>
+        <td>${p.seq}</td>
+        <td>${p.label || p.id}</td>
+        <td>${typeName[p.kind] || p.kind}</td>
+        <td>${seg ? (seg.blocked ? "—" : seg.lengthM?.toFixed(1)) : "—"}</td>
+        <td>${seg && !seg.blocked ? (seg.lengthM / speed / 60).toFixed(2) : "—"}</td>
+        <td class="${seg?.blocked ? "bad" : ""}">${
+          seg ? (seg.blocked ? "✗ 无法连通：" + seg.reason.summary : "✓ 可通行") : "终点"}</td>
+      </tr>`;
+    }
+    tb.innerHTML = html;
+  }
+})();
+</script>
+</body>
+</html>

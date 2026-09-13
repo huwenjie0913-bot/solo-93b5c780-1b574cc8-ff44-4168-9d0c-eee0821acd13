@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>厂房巡检路线编排器</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🏭 巡检路线编排器</div>
+  <div class="plan-area">
+    <select id="planSelect" title="方案列表"></select>
+    <button id="newPlanBtn" class="btn">新建</button>
+    <button id="dupPlanBtn" class="btn" title="复制当前方案">复制</button>
+    <button id="delPlanBtn" class="btn danger" title="删除当前方案">删除</button>
+    <input id="planName" class="plan-name" placeholder="方案名称">
+    <button id="saveBtn" class="btn primary">保存方案</button>
+  </div>
+  <div class="top-actions">
+    <button id="snapBtn" class="btn" title="把当前方案另存为快照，用于对比">📸 另存快照</button>
+    <button id="compareBtn" class="btn">⇄ 方案对比</button>
+    <button id="printBtn" class="btn">🖨 打印页</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左侧工具 -->
+  <aside class="sidebar">
+    <div class="tool-group" id="toolGroup">
+      <h3>绘制工具</h3>
+      <div class="tools">
+        <button class="tool" data-tool="select">↖ 选择/拖动</button>
+        <button class="tool" data-tool="wall">▌墙</button>
+        <button class="tool" data-tool="door">🚪门</button>
+        <button class="tool" data-tool="window">▭ 窗</button>
+        <button class="tool" data-tool="zone" title="禁入区：依次点击形成多边形，双击闭合">⛔ 禁入区</button>
+        <button class="tool" data-tool="start">🟢 起点</button>
+        <button class="tool" data-tool="end">🔴 终点</button>
+        <button class="tool" data-tool="must">⭐ 必经点</button>
+        <button class="tool" data-tool="erase">🧹 删除</button>
+      </div>
+      <div class="hint" id="toolHint">选择工具后在画布上操作</div>
+      <div class="zone-actions" id="zoneActions" hidden>
+        <button id="zoneCloseBtn" class="btn small">闭合多边形</button>
+        <button id="zoneCancelBtn" class="btn small">取消</button>
+      </div>
+    </div>
+
+    <div class="tool-group">
+      <h3>平面图</h3>
+      <label class="file-btn btn small">
+        导入黑白/灰度平面图
+        <input type="file" id="imageInput" accept="image/*" hidden>
+      </label>
+      <div class="row" id="imageInfo" hidden>
+        <span id="imageInfoText"></span>
+        <button id="removeImageBtn" class="btn small danger">移除</button>
+      </div>
+      <label class="row">实体识别阈值
+        <input type="range" id="threshold" min="1" max="254" value="128">
+        <span id="thresholdVal">128</span>
+      </label>
+      <label class="row check"><input type="checkbox" id="showOccupancy"> 显示识别出的实体</label>
+    </div>
+
+    <div class="tool-group">
+      <h3>比例尺校准</h3>
+      <button id="calibBtn" class="btn small">在图上拖一段已知长度</button>
+      <div class="row">实际长度（米）<input type="number" id="calibMeters" min="0.1" step="0.1" placeholder="例如 10"></div>
+      <div class="hint" id="calibInfo">未校准，默认 1m = 40px</div>
+    </div>
+
+    <div class="tool-group">
+      <h3>巡检参数</h3>
+      <label class="row">巡检间距（米，覆盖保证）
+        <input type="number" id="spacing" min="0.5" step="0.5" value="6">
+      </label>
+      <label class="row">安全余量（米，离墙距离）
+        <input type="number" id="margin" min="0" step="0.05" value="0.3">
+      </label>
+      <label class="row">每点停留（秒）
+        <input type="number" id="dwell" min="0" step="5" value="30">
+      </label>
+      <label class="row">步行速度（米/秒）
+        <input type="number" value="1.2" disabled title="用于估算总用时">
+      </label>
+    </div>
+
+    <div class="tool-group">
+      <button id="computeBtn" class="btn primary big">生成 / 重算巡检路线</button>
+      <label class="row check"><input type="checkbox" id="autoRecompute" checked> 编辑后自动重算</label>
+    </div>
+  </aside>
+
+  <!-- 画布 -->
+  <section class="canvas-wrap">
+    <canvas id="canvas" width="1200" height="800"></canvas>
+    <div class="canvas-hud" id="hud"></div>
+    <div class="legend">
+      <span><i class="lg l-route"></i>路线</span>
+      <span><i class="lg l-blocked"></i>受阻路段</span>
+      <span><i class="lg l-uncovered"></i>未覆盖区域</span>
+      <span><i class="lg l-start"></i>起/终点</span>
+      <span><i class="lg l-must"></i>必经点</span>
+      <span><i class="lg l-auto"></i>巡检点</span>
+      <span><i class="lg l-door"></i>门（绿开红闭）</span>
+    </div>
+  </section>
+
+  <!-- 右侧结果 -->
+  <aside class="sidebar right">
+    <div class="tool-group stats">
+      <h3>路线统计</h3>
+      <div class="stat"><span>总里程</span><b id="statLength">—</b></div>
+      <div class="stat"><span>预计用时</span><b id="statEta">—</b></div>
+      <div class="stat"><span>巡检点</span><b id="statPoints">—</b></div>
+      <div class="stat"><span>覆盖率</span>
+        <b id="statCoverage" class="cov">—</b></div>
+      <div class="stat"><span>未覆盖面积</span><b id="statUncovered">—</b></div>
+      <div class="stat"><span>受阻路段</span><b id="statBlocked">—</b></div>
+      <div class="hint" id="incInfo"></div>
+    </div>
+
+    <div class="tool-group">
+      <h3>提示与诊断</h3>
+      <ul class="messages" id="messages"></ul>
+    </div>
+
+    <div class="tool-group">
+      <h3>显示图层</h3>
+      <label class="row check"><input type="checkbox" class="layer" data-layer="walls" checked> 墙/窗</label>
+      <label class="row check"><input type="checkbox" class="layer" data-layer="zones" checked> 禁入区</label>
+      <label class="row check"><input type="checkbox" class="layer" data-layer="points" checked> 点位与编号</label>
+      <label class="row check"><input type="checkbox" class="layer" data-layer="route" checked> 路线与方向</label>
+      <label class="row check"><input type="checkbox" class="layer" data-layer="uncovered" checked> 未覆盖区域</label>
+      <label class="row check"><input type="checkbox" class="layer" data-layer="grid"> 栅格</label>
+    </div>
+
+    <div class="tool-group">
+      <h3>点位序列（点击定位）</h3>
+      <ol class="point-list" id="pointList"></ol>
+    </div>
+  </aside>
+</main>
+
+<!-- 对比弹窗 -->
+<div class="modal-mask" id="compareMask" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3>方案对比</h3>
+      <button class="btn small" id="compareCloseBtn">关闭</button>
+    </div>
+    <div id="compareBody"></div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/api.js') }}"></script>
+<script src="{{ url_for('static', filename='js/state.js') }}"></script>
+<script src="{{ url_for('static', filename='js/occupancy.js') }}"></script>
+<script src="{{ url_for('static', filename='js/canvas.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

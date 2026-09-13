@@ -3,25 +3,62 @@
 对外主入口：
     build_route(plan)                 —— 全量生成候选点 + 排序 + A*
     update_route(plan, cache, edits)  —— 只重算受影响路段
+
+多人分区编排（settings.workers >= 2）：
+    自动巡检点与必经点按估时负载均衡分成多条路线（实际栅格距离），
+    支持共同起终点或每人员独立起终点；结果同时给出：
+      - routes[i]：每人员的统计、告警、颜色等元信息
+      - points / segments：拍平的全量数据（带 worker 字段，兼容旧渲染）
+      - stats：全队汇总（totalLengthM=总里程，etaMinutes/maxEtaMinutes=最长用时）
 """
 
 from __future__ import annotations
 
+import math
 import time
 
 from . import raster as ras
 from .gridcache import get_grid
-from .graph import astar, diagnose, distance_field, label_components, snap_point
-from .planner import generate_candidates, optimize_order
+from .graph import (astar, diagnose, distance_field, label_components,
+                    snap_point)
+from .planner import generate_candidates, optimize_order, partition_balance
 
 DEFAULT_PPM = 40.0          # 未校准时 1m = 40px
 WALK_SPEED_MPS = 1.2        # 预计用时的默认步行速度
 DWELL_S = 30.0              # 每点停留检查时间
 
+MAX_WORKERS = 8
+# 人员路线配色（与前端 canvas.js 的 WORKER_COLORS 保持一致）
+WORKER_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#d97706",
+                 "#7c3aed", "#0891b2", "#db2777", "#65a30d"]
+
 
 def _ppm(plan: dict) -> float:
     v = (plan.get("calibration") or {}).get("pixelsPerMeter")
     return DEFAULT_PPM if v is None else float(v)
+
+
+def _workers(plan: dict) -> int:
+    """人员数；缺省/非法值都按 1（单人模式，兼容旧方案）。"""
+    v = (plan.get("settings") or {}).get("workers")
+    try:
+        return max(1, min(MAX_WORKERS, int(v)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _max_minutes(plan: dict) -> float:
+    """单人时长上限（分钟），0/缺省表示不限。"""
+    v = (plan.get("settings") or {}).get("maxMinutes")
+    try:
+        return max(0.0, float(v))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _start_mode(plan: dict) -> str:
+    v = (plan.get("settings") or {}).get("startMode")
+    return "individual" if v == "individual" else "shared"
 
 
 def _fingerprint(plan: dict) -> str:
@@ -73,8 +110,10 @@ def build_route(plan: dict) -> dict:
     comp = grid.get("comp") or label_components(blocked, gw, gh)
 
     warnings: list[str] = []
+    k = _workers(plan)
+    individual = k >= 2 and _start_mode(plan) == "individual"
 
-    # 1) 固定点：起点 / 必经点 / 终点
+    # 1) 固定点：起点 / 必经点 / 终点（多人独立模式下共享起终点不参与）
     start_rec = end_rec = None
     must_recs: list[dict] = []
 
@@ -90,7 +129,9 @@ def build_route(plan: dict) -> dict:
             warnings.append(f"{kind_name}「{name}」落在障碍上，已自动挪到最近可通行位置")
         return _make_record(raw.get("id"), kind, raw.get("label"), gx, gy, cell, moved)
 
-    if plan.get("start"):
+    if individual:
+        pass   # 各自独立起终点，共享起终点不参与
+    elif plan.get("start"):
         start_rec = snap(plan["start"], "start")
     else:
         warnings.append("尚未设置起点")
@@ -98,7 +139,9 @@ def build_route(plan: dict) -> dict:
         r = snap(p, "must")
         if r:
             must_recs.append(r)
-    if plan.get("end"):
+    if individual:
+        pass
+    elif plan.get("end"):
         end_rec = snap(plan["end"], "end")
     else:
         warnings.append("尚未设置终点（路线将以起点收束）")
@@ -112,9 +155,23 @@ def build_route(plan: dict) -> dict:
             r["kind"] = "auto"
             manual_recs.append(r)
 
+    # 多人独立起终点：按人员索引吸附（参与候选点保留格，避免与自动点重叠）
+    worker_starts: list[dict | None] = []
+    worker_ends: list[dict | None] = []
+    if individual:
+        ws = plan.get("workerStarts") or []
+        we = plan.get("workerEnds") or []
+        for i in range(k):
+            raw = ws[i] if i < len(ws) else None
+            worker_starts.append(snap(raw, "start") if raw else None)
+        for i in range(k):
+            raw = we[i] if i < len(we) else None
+            worker_ends.append(snap(raw, "end") if raw else None)
+
     # 2) 自动候选点（保留已吸附的固定格，避免与自动点重叠）
     keep = []
-    for r in (start_rec, *must_recs, *manual_recs, end_rec):
+    for r in (start_rec, *must_recs, *manual_recs, end_rec,
+              *worker_starts, *worker_ends):
         if r:
             keep.append((r["gx"], r["gy"]))
     spacing = _spacing(plan)
@@ -128,7 +185,14 @@ def build_route(plan: dict) -> dict:
     for i, (gx, gy) in enumerate(c for c in auto_cells if c not in keep_set):
         auto_recs.append(_make_record(f"A{i+1:03d}", "auto", "", gx, gy, cell))
 
-    # 3) 排序：序列 [start] + (must + auto) + [end]，端点固定做 2-opt
+    # 3) 多人分区编排：均衡分组 + 每组排序连段
+    if k >= 2:
+        starts = worker_starts if individual else [start_rec] * k
+        ends = worker_ends if individual else [end_rec] * k
+        return _build_multi(plan, blocked, reason, gw, gh, cell, ppm, comp,
+                            starts, ends, must_recs, auto_recs, warnings, t0)
+
+    # 4) 单人：序列 [start] + (must + auto) + [end]，端点固定做 2-opt
     middle = must_recs + auto_recs
     seq = ([start_rec] if start_rec else []) + middle + ([end_rec] if end_rec else [])
     if not seq:

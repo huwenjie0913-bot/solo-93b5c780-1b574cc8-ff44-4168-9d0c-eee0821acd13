@@ -234,6 +234,264 @@ def _empty_result(plan, gw, gh, cell, blocked, reason, comp, warnings, t0):
     }
 
 
+# ---------------------------------------------------------------------------
+# 多人分区编排：均衡分组 → 组内排序 → 逐段 A* → 再均衡 → 汇总
+# ---------------------------------------------------------------------------
+
+def _build_multi(plan, blocked, reason, gw, gh, cell, ppm, comp,
+                 starts, ends, must_recs, auto_recs, warnings, t0):
+    """把自动巡检点与必经点分成负载均衡的 k 条路线并汇总结果。"""
+    k = len(starts)
+    dwell = _dwell(plan)
+    visit = must_recs + auto_recs
+
+    locked, stale = _locked_map(plan, k, {r["id"] for r in visit})
+    if stale:
+        warnings.append(f"{stale} 条人工分配已失效（点位或人员不存在），已按自动分配处理")
+
+    # 从各起点出发的实际栅格距离场，用于分区时的负载估计
+    dist_fields = [
+        distance_field([s["gy"] * gw + s["gx"]], blocked, gw, gh) if s else None
+        for s in starts
+    ]
+    groups = partition_balance(visit, k, starts, dist_fields, locked,
+                               gw, cell, ppm, dwell)
+
+    routes = []
+    for i in range(k):
+        recs = _order_route(groups[i], starts[i], ends[i]) if groups[i] else []
+        routes.append({
+            "start": starts[i], "end": ends[i], "group": groups[i],
+            "records": recs,
+            "conn": _connect_segments(plan, recs, blocked, reason,
+                                      gw, gh, cell, ppm, comp),
+        })
+
+    _rebalance(plan, routes, locked, blocked, reason, gw, gh, cell, ppm, comp)
+
+    return _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell,
+                           ppm, _spacing(plan), warnings, t0, {"mode": "full"})
+
+
+def _locked_map(plan, k, valid_ids=None):
+    """读取人工锁定分配 {点位id: 人员序号}，过滤越界/失效项，返回 (映射, 失效数)。"""
+    locked: dict[str, int] = {}
+    stale = 0
+    for pid, w in (plan.get("assignments") or {}).items():
+        try:
+            w = int(w)
+        except (TypeError, ValueError):
+            stale += 1
+            continue
+        if 0 <= w < k and (valid_ids is None or pid in valid_ids):
+            locked[pid] = w
+        else:
+            stale += 1
+    return locked, stale
+
+
+def _order_route(group, start_rec, end_rec):
+    """单条路线排序：[start] + group + [end]，端点固定 2-opt，返回带 seq 的记录。"""
+    seq = ([start_rec] if start_rec else []) + list(group) + \
+          ([end_rec] if end_rec else [])
+    if not seq:
+        return []
+    xy = [(r["x"], r["y"]) for r in seq]
+    perm = optimize_order(xy, fixed_start=bool(start_rec),
+                          fixed_end=bool(end_rec))
+    out = []
+    for new_i, old_i in enumerate(perm):
+        r = dict(seq[old_i])
+        r["seq"] = new_i + 1
+        out.append(r)
+    return out
+
+
+def _remove_delta(seq, j):
+    """从序列移除第 j 个点节省的欧氏距离（像素）。"""
+    rec = seq[j]
+    prev = seq[j - 1] if j > 0 else None
+    nxt = seq[j + 1] if j + 1 < len(seq) else None
+    d = 0.0
+    if prev:
+        d += math.hypot(rec["x"] - prev["x"], rec["y"] - prev["y"])
+    if nxt:
+        d += math.hypot(rec["x"] - nxt["x"], rec["y"] - nxt["y"])
+    if prev and nxt:
+        d -= math.hypot(prev["x"] - nxt["x"], prev["y"] - nxt["y"])
+    return max(0.0, d)
+
+
+def _insert_delta(seq, rec):
+    """把点插入序列的最小额外欧氏距离（像素）。"""
+    if not seq:
+        return 0.0
+    best = math.inf
+    for j in range(len(seq) + 1):
+        prev = seq[j - 1] if j > 0 else None
+        nxt = seq[j] if j < len(seq) else None
+        cost = 0.0
+        if prev:
+            cost += math.hypot(rec["x"] - prev["x"], rec["y"] - prev["y"])
+        if nxt:
+            cost += math.hypot(rec["x"] - nxt["x"], rec["y"] - nxt["y"])
+        if prev and nxt:
+            cost -= math.hypot(prev["x"] - nxt["x"], prev["y"] - nxt["y"])
+        if cost < best:
+            best = cost
+    return max(0.0, best)
+
+
+def _rebalance(plan, routes, locked_ids, blocked, reason, gw, gh, cell, ppm, comp):
+    """把最忙人员的未锁定点挪给最闲人员，直到最长/最短路线用时足够接近。"""
+    k = len(routes)
+    if k <= 1:
+        return
+    dwell = _dwell(plan)
+    for _ in range(24):
+        times = [r["conn"]["stats"]["etaMinutes"] for r in routes]
+        hi = max(range(k), key=lambda i: times[i])
+        lo = min(range(k), key=lambda i: times[i])
+        mean = sum(times) / k
+        if times[hi] - times[lo] <= max(1.0, 0.05 * mean):
+            break
+        movable = [r for r in routes[hi]["group"] if r["id"] not in locked_ids]
+        if not movable:
+            break
+        base = max((times[i] for i in range(k) if i not in (hi, lo)), default=0.0)
+        seq_hi = routes[hi]["records"]
+        seq_lo = routes[lo]["records"]
+        best = None
+        for rec in movable:
+            j = next((idx for idx, r in enumerate(seq_hi)
+                      if r["id"] == rec["id"]), None)
+            if j is None:
+                continue
+            save = _remove_delta(seq_hi, j)
+            add = _insert_delta(seq_lo, rec)
+            t_hi = times[hi] - (save / ppm / WALK_SPEED_MPS + dwell) / 60.0
+            t_lo = times[lo] + (add / ppm / WALK_SPEED_MPS + dwell) / 60.0
+            new_max = max(t_hi, t_lo, base)
+            if best is None or new_max < best[0]:
+                best = (new_max, rec)
+        if best is None or best[0] >= times[hi] - 0.05:
+            break
+        rec = best[1]
+        routes[hi]["group"] = [r for r in routes[hi]["group"]
+                               if r["id"] != rec["id"]]
+        routes[lo]["group"] = list(routes[lo]["group"]) + [rec]
+        for i in (hi, lo):
+            routes[i]["records"] = _order_route(routes[i]["group"],
+                                                routes[i]["start"],
+                                                routes[i]["end"])
+            routes[i]["conn"] = _connect_segments(plan, routes[i]["records"],
+                                                  blocked, reason, gw, gh,
+                                                  cell, ppm, comp)
+
+
+def _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell, ppm,
+                    spacing, warnings, t0, incremental):
+    """汇总各人员路线：routes 元信息 + 拍平 points/segments + 全队统计。"""
+    k = len(routes)
+    max_min = _max_minutes(plan)
+    all_points: list[dict] = []
+    all_segments: list[dict] = []
+    routes_meta: list[dict] = []
+    blocked_count = 0
+    overtime_count = 0
+
+    for i, rt in enumerate(routes):
+        conn = rt["conn"]
+        st = conn["stats"]
+        for r in rt["records"]:
+            p = dict(r)
+            p["worker"] = i
+            if r["id"] in locked:
+                p["locked"] = True
+            all_points.append(p)
+        for s in conn["segments"]:
+            seg = dict(s)
+            seg["worker"] = i
+            all_segments.append(seg)
+        blocked_count += st["blockedCount"]
+
+        overtime = bool(max_min > 0 and st["etaMinutes"] > max_min)
+        if overtime:
+            overtime_count += 1
+        rt_warnings = []
+        if overtime:
+            rt_warnings.append(
+                f"人员 {i + 1} 预计用时 {st['etaMinutes']:.0f} 分钟，"
+                f"超出单人上限 {max_min:.0f} 分钟")
+        if st["blockedCount"]:
+            rt_warnings.append(f"人员 {i + 1} 有 {st['blockedCount']} 段路线不可达")
+        if not rt["records"]:
+            rt_warnings.append(f"人员 {i + 1} 未分配到点位")
+        warnings.extend(rt_warnings)
+        routes_meta.append({
+            "worker": i,
+            "label": f"人员 {i + 1}",
+            "color": WORKER_COLORS[i % len(WORKER_COLORS)],
+            "stats": {**st, "overtime": overtime},
+            "warnings": rt_warnings,
+            "blockedSegments": conn["blockedSegments"],
+        })
+
+    total_m = sum(rt["conn"]["stats"]["totalLengthM"] for rt in routes)
+    makespan = max((rt["conn"]["stats"]["etaMinutes"] for rt in routes),
+                   default=0.0)
+    stats = {
+        "totalLengthM": round(total_m, 1),   # 全队总里程
+        "etaMinutes": round(makespan, 1),    # 全队最长用时
+        "maxEtaMinutes": round(makespan, 1),
+        "pointCount": len({p["id"] for p in all_points}),
+        "workers": k,
+        "walkSpeedMps": WALK_SPEED_MPS,
+        "dwellSeconds": _dwell(plan),
+        "blockedCount": blocked_count,
+        "overtimeCount": overtime_count,
+        "maxMinutes": max_min or None,
+    }
+
+    return {
+        "mode": "multi",
+        "workers": k,
+        "routes": routes_meta,
+        "points": all_points,
+        "segments": all_segments,
+        "blockedSegments": [s["seq"] for s in all_segments if s.get("blocked")],
+        "warnings": warnings,
+        "coverage": _coverage(all_points, all_segments, blocked, comp,
+                              gw, gh, cell, ppm, spacing),
+        "stats": stats,
+        "gridInfo": {"gw": gw, "gh": gh, "cellPx": round(cell, 2)},
+        "cache": _make_cache_multi(plan, gw, gh, cell, routes),
+        "incremental": incremental,
+        "elapsedMs": int((time.time() - t0) * 1000),
+    }
+
+
+def _make_cache_multi(plan, gw, gh, cell, routes):
+    return {
+        "mode": "multi",
+        "fingerprint": _fingerprint(plan),
+        "gw": gw, "gh": gh, "cell": cell,
+        "workers": len(routes),
+        "routes": [
+            {"points": [{"id": r["id"], "gx": r["gx"], "gy": r["gy"],
+                         "kind": r["kind"], "seq": r["seq"],
+                         "label": r.get("label") or ""}
+                        for r in rt["records"]],
+             "segments": [{"from": s["from"], "to": s["to"],
+                           "fromSeq": s.get("fromSeq"), "toSeq": s.get("toSeq"),
+                           "pathCells": s.get("pathCells"),
+                           "cost": s.get("cost")}
+                          for s in rt["conn"]["segments"]]}
+            for rt in routes
+        ],
+    }
+
+
 def _make_cache(plan, gw, gh, cell, records, segments) -> dict:
     return {
         "fingerprint": _fingerprint(plan),

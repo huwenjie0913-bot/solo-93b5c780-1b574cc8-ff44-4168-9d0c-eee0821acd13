@@ -1,0 +1,4 @@
+# 厂房巡检路线编排器运行依赖
+# 安装：pip install -r requirements.txt
+# 启动：python3 -m app
+Flask==3.1.3

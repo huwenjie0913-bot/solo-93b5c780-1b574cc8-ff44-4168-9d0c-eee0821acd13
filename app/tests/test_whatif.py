@@ -111,6 +111,44 @@ def test_off_shift_closure_ignored():
           "无不可达点/封路冲突")
 
 
+def test_pre_shift_closure_still_blocks():
+    """边界：封路从班次开始前延续进执行期（07:00–09:00，巡逻 08:00–08:01）。
+
+    07:00 早于班次 08:00，但不得被解释成次日；该通道必须参与重算，
+    产生断点/不可达点与封路冲突，路线不能穿过封闭通道。
+    """
+    from app.geometry.whatif import _window_overlaps_patrol
+    plan = shift_plan()
+    base = build_route(plan)
+    assert base["stats"].get("finishClock") == "08:01"
+
+    # 直接校核相交判定（旧逻辑会把 07:00 当成次日而误判 False）
+    sc = {"effectiveStart": "07:00", "effectiveEnd": "09:00"}
+    assert _window_overlaps_patrol(sc, base, plan) is True
+
+    closures = door_closure("07:00", "09:00")
+    scen = {"name": "班前延续封路", "closures": closures}
+    active, idle = active_closures(scen, plan, base)
+    assert [c["id"] for c in active] == ["c1"] and idle == [], \
+        "07:00–09:00 与 08:00–08:01 相交，应参与重算"
+
+    variant_plan, notes = apply_scenario(plan, scen, baseline=base)
+    assert variant_plan.get("_tempBlockers"), "相交通道必须写入临时障碍层"
+    assert not any("不重叠" in n for n in notes)
+
+    ev = evaluate_scenario(plan, scen, baseline=base)
+    s = ev["impact"]["summary"]
+    assert ev["variant"]["stats"]["blockedCount"] >= 1, \
+        "班前延续封路应使路线出现断点"
+    assert s["droppedCount"] + s["blockedPointCount"] >= 1, \
+        "应报告不可达巡检点"
+    assert any(c["severity"] == "high" for c in ev["impact"]["conflicts"]), \
+        "应报告高级别封路冲突"
+    assert ev["impact"].get("idleClosures") == [], "不得把该通道列为错峰"
+    print("✓ 班前延续封路（07:00–09:00，巡逻 08:00–08:01）参与重算，"
+          "报告断点/不可达点/冲突")
+
+
 def test_in_shift_closure_still_blocks():
     """对照：生效时段与巡逻重叠时必须照常封死。"""
     plan = shift_plan()

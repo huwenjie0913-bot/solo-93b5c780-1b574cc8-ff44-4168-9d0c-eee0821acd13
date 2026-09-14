@@ -113,26 +113,37 @@ def normalize_scenario(sc: dict | None) -> dict:
 
 
 def _window_overlaps_patrol(sc: dict, route: dict, plan: dict) -> bool | None:
-    """封路时段是否与本班巡检时间区间相交。无班次信息返回 None（无法判定）。"""
+    """封路时段是否与本班巡逻时间相交。无班次信息返回 None（无法判定）。
+
+    在绝对分钟轴上比较，避免把「早于班次开始」的时刻一律当成次日：
+    巡逻窗为 [班次开始, 预计交岗]（可跨午夜）；封路窗按当天 HH:MM
+    解析，end<=start 视为跨午夜，再整体平移到前一天/当天/次日三种
+    对齐，任一与巡逻窗相交即判重叠。例如班次 08:00、巡逻 08:00–08:01，
+    封路 07:00–09:00（早于班次开始但延续进执行期）应判为重叠。
+    """
     start_clock, end_clock = sc.get("effectiveStart"), sc.get("effectiveEnd")
     if not start_clock or not end_clock:
         return None
     shift = sch.shift_start_minutes(plan)
     if shift is None:
         return None
-    s1 = sch.clock_offset(start_clock, shift)
-    e1 = sch.clock_offset(end_clock, shift)
-    if e1 <= s1:
-        e1 += 1440
+    cs = sch.parse_clock(start_clock)
+    ce = sch.parse_clock(end_clock)
+    if cs is None or ce is None:
+        return None
+    if ce <= cs:
+        ce += 1440          # 当天 end<=start：封路跨午夜
     finish = (route.get("stats") or {}).get("finishClock")
-    s2, e2 = 0.0, None
-    if finish:
-        e2 = sch.clock_offset(finish, shift)
-        if e2 <= 0:
-            e2 += 1440
-    if e2 is None:
-        e2 = 1440
-    return s1 < e2 and s2 < e1
+    if not finish:
+        return None
+    pat_len = sch.clock_offset(finish, shift)   # 交岗相对班次的分钟 0..1439
+    p0, p1 = float(shift), float(shift) + float(pat_len)
+    # 封路可能位于前一天、当天或次日（如夜班巡逻跨过午夜）
+    for k in (-1, 0, 1):
+        c0, c1 = cs + k * 1440, ce + k * 1440
+        if c0 < p1 and p0 < c1:
+            return True
+    return False
 
 
 def active_closures(scenario: dict, plan: dict,
@@ -613,29 +624,6 @@ def _schedule_entries(route: dict) -> dict[tuple[str, int], dict]:
         for e in route.get("schedule", {}).get("entries", []):
             out[(e["id"], e.get("worker") or 0)] = e
     return out
-
-
-def _window_overlaps_patrol(sc: dict, route: dict, plan: dict) -> bool | None:
-    """封路时段是否与本班巡检时间区间相交。无班次信息返回 None（无法判定）。"""
-    start_clock, end_clock = sc.get("effectiveStart"), sc.get("effectiveEnd")
-    if not start_clock or not end_clock:
-        return None
-    shift = sch.shift_start_minutes(plan)
-    if shift is None:
-        return None
-    s1 = sch.clock_offset(start_clock, shift)
-    e1 = sch.clock_offset(end_clock, shift)
-    if e1 <= s1:
-        e1 += 1440
-    finish = (route.get("stats") or {}).get("finishClock")
-    s2, e2 = 0.0, None
-    if finish:
-        e2 = sch.clock_offset(finish, shift)
-        if e2 <= 0:
-            e2 += 1440
-    if e2 is None:
-        e2 = 1440
-    return s1 < e2 and s2 < e1
 
 
 def _build_conflicts(scenario, variant, variant_plan, affected, new_points,

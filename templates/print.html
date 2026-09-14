@@ -25,12 +25,17 @@
 
 <h3 style="margin-top:18px">行走次序表</h3>
 <table class="print-table" id="seqTable">
-  <thead><tr>
+  <thead><tr id="seqHead">
     <th>次序</th><th>点号</th><th>类型</th><th>到下一点距离 (m)</th>
     <th>到下一点用时 (分)</th><th>状态</th>
   </tr></thead>
   <tbody></tbody>
 </table>
+
+<div id="schedConflictWrap" hidden style="margin-top:14px">
+  <h3>排程冲突与等待</h3>
+  <ul id="schedConflicts" style="font-size:12px;color:#b91c1c"></ul>
+</div>
 
 <script>
 const PLAN = {{ plan.data | tojson }};
@@ -109,24 +114,51 @@ const ROUTE = {{ (plan.route or {}) | tojson }};
       }
     }
 
-    // 点位编号
+    // 点位编号（有排程时高亮等待点与逾期点）
+    const schedMap = {};
+    for (const e of ROUTE.schedule?.entries || [])
+      schedMap[e.id + "#" + (e.worker ?? "")] = e;
     for (const p of ROUTE.points || []) {
       let col = "#2563eb", fill = "#fff", r = 7;
       if (p.kind === "start") { col = "#16a34a"; fill = col; r = 10; }
       if (p.kind === "end") { col = "#dc2626"; fill = col; r = 10; }
       if (p.kind === "must") { col = "#f59e0b"; fill = col; r = 9; }
+      const sc = schedMap[p.id + "#" + (p.worker ?? "")];
+      // 等待=青色环，逾期=红色粗环（画在点之下）
+      if (sc && sc.lateMin > 0) {
+        ctx.beginPath(); ctx.arc(p.x, p.y, r + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 3.5; ctx.stroke();
+      } else if (sc && sc.waitMin > 0) {
+        ctx.beginPath(); ctx.arc(p.x, p.y, r + 5, 0, Math.PI * 2);
+        ctx.strokeStyle = "#0891b2"; ctx.lineWidth = 3; ctx.stroke();
+      }
       ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
       ctx.fillStyle = fill; ctx.fill();
       ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke();
       ctx.fillStyle = col; ctx.font = "bold 13px sans-serif";
       ctx.textAlign = "center";
       ctx.fillText(p.seq, p.x, p.y - r - 5);
+      if (sc && (sc.waitMin > 0 || sc.lateMin > 0)) {
+        const tag = sc.lateMin > 0
+          ? `超${Math.ceil(sc.lateMin)}′ ${sc.arrivalClock}`
+          : `等${Math.round(sc.waitMin)}′ ${sc.arrivalClock}`;
+        ctx.font = "11px sans-serif";
+        const tw = ctx.measureText(tag).width;
+        ctx.fillStyle = sc.lateMin > 0 ? "#dc2626" : "#0891b2";
+        ctx.fillRect(p.x - tw / 2 - 3, p.y + r + 2, tw + 6, 14);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(tag, p.x, p.y + r + 12);
+      }
     }
     fillTable();
   }
 
   function fillTable() {
     const s = ROUTE.stats || {};
+    const sch = ROUTE.schedule || null;
+    const hasSched = !!(sch && sch.summary && sch.summary.shiftStart);
+    const sm = hasSched ? sch.summary : {};
+
     document.getElementById("meta").innerHTML = `
       <span>总里程 <b>${s.totalLengthM ?? "—"} m</b></span>
       <span>预计用时 <b>${s.etaMinutes ?? "—"} 分钟</b></span>
@@ -134,26 +166,66 @@ const ROUTE = {{ (plan.route or {}) | tojson }};
       <span>覆盖率 <b>${ROUTE.coverage?.percent ?? "—"}%</b></span>
       <span>未覆盖 <b>${ROUTE.coverage?.uncoveredAreaM2 ?? "—"} m²</b></span>
       <span>受阻路段 <b>${s.blockedCount ?? 0}</b></span>
+      ${hasSched ? `
+        <span>班次 <b>${sm.shiftStart}</b></span>
+        <span>交岗 <b>${sm.finishClock}</b></span>
+        <span>等待 <b>${sm.waitMinutes ?? 0} 分 / ${sm.waitPoints ?? 0} 站</b></span>
+        <span style="color:${sm.latePoints ? "#b91c1c" : ""}">超窗 <b>${sm.lateMinutes ?? 0} 分 / ${sm.latePoints ?? 0} 站</b></span>
+        <span>排程 <b>${sm.feasible ? "可行" : "有冲突"}</b></span>` : ""}
       <span>生成时间 ${new Date().toLocaleString("zh-CN")}</span>`;
+
+    // 有排程时扩展表头：计划到达 / 计划离开 / 时间窗
+    const head = document.getElementById("seqHead");
+    if (hasSched) {
+      head.innerHTML = `
+        <th>次序</th><th>点号</th><th>类型</th><th>到下一点距离 (m)</th>
+        <th>到下一点用时 (分)</th><th>计划到达</th><th>计划离开</th>
+        <th>等待(分)</th><th>超窗(分)</th><th>状态</th>`;
+    }
 
     const typeName = { start: "起点", end: "终点", must: "必经点", auto: "巡检点" };
     const tb = document.querySelector("#seqTable tbody");
     const speed = s.walkSpeedMps || 1.2;
+    const entryById = {};
+    for (const e of sch?.entries || []) entryById[e.id + "#" + (e.worker ?? "")] = e;
     let html = "";
     const segs = ROUTE.segments || [];
     for (const p of ROUTE.points || []) {
       const seg = segs.find((x) => x.from === p.id);
-      html += `<tr>
+      const e = entryById[p.id + "#" + (p.worker ?? "")];
+      let status;
+      if (seg) status = seg.blocked
+        ? `<span class="bad">✗ 无法连通：${seg.reason.summary}</span>`
+        : "✓ 可通行";
+      else status = "终点";
+      if (e && e.lateMin > 0) status += ` <b class="bad">超窗 ${Math.ceil(e.lateMin)}′</b>`;
+      else if (e && e.waitMin > 0) status += ` <span style="color:#0e7490">等待 ${Math.round(e.waitMin)}′</span>`;
+      html += `<tr${e && e.lateMin > 0 ? ' class="bad"' : ""}>
         <td>${p.seq}</td>
         <td>${p.label || p.id}</td>
         <td>${typeName[p.kind] || p.kind}</td>
         <td>${seg ? (seg.blocked ? "—" : seg.lengthM?.toFixed(1)) : "—"}</td>
         <td>${seg && !seg.blocked ? (seg.lengthM / speed / 60).toFixed(2) : "—"}</td>
-        <td class="${seg?.blocked ? "bad" : ""}">${
-          seg ? (seg.blocked ? "✗ 无法连通：" + seg.reason.summary : "✓ 可通行") : "终点"}</td>
+        ${hasSched ? `
+          <td>${e ? e.arrivalClock : "—"}</td>
+          <td>${e ? e.leaveClock : "—"}</td>
+          <td>${e ? Math.round(e.waitMin) : "—"}</td>
+          <td>${e && e.lateMin > 0 ? Math.ceil(e.lateMin) : "0"}</td>` : ""}
+        <td>${status}</td>
       </tr>`;
     }
     tb.innerHTML = html;
+
+    // 排程冲突点与原因
+    const cw = document.getElementById("schedConflictWrap");
+    const cu = document.getElementById("schedConflicts");
+    if (hasSched && sch.conflicts?.length) {
+      cw.hidden = false;
+      cu.innerHTML = sch.conflicts.map((c) => {
+        const who = c.worker != null ? `（人员 ${c.worker + 1}）` : "";
+        return `<li>${who}${c.message}</li>`;
+      }).join("");
+    }
   }
 })();
 </script>

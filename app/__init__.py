@@ -74,7 +74,12 @@ def register_routes(app: Flask) -> None:
         payload = request.get_json(force=True, silent=True) or {}
         data = payload.get("data") or default_plan()
         name = (payload.get("name") or data.get("name") or "未命名方案").strip()
-        pid = db.create_plan(name, data, None)
+        # 首次保存即带上已算好的路线（含时间轴排程与关键指标），
+        # 否则重新打开/打印页会因 route_json 为空而丢失路线
+        route = payload.get("route")
+        if not isinstance(route, dict):
+            route = None
+        pid = db.create_plan(name, data, route)
         return jsonify({"id": pid, **db.get_plan(pid)}), 201
 
     @app.get("/api/plans/<int:pid>")

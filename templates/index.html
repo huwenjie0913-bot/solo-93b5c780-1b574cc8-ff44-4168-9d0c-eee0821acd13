@@ -88,6 +88,24 @@
     </div>
 
     <div class="tool-group">
+      <h3>班次与排程</h3>
+      <label class="row">班次开始时间
+        <input type="time" id="shiftStart" step="60" placeholder="留空=不排程">
+      </label>
+      <div class="hint" id="shiftHint">设置班次开始后，按必经点时间窗重排访问顺序并逐站核算时刻；留空则保持仅按距离编排。</div>
+      <label class="row">巡检人数
+        <input type="number" id="workers" min="1" max="8" step="1" value="1">
+      </label>
+    </div>
+
+    <div class="tool-group">
+      <h3>必经点时间窗</h3>
+      <div id="mustWindows" class="must-wins">
+        <div class="hint">用 ⭐ 必经点 工具在图上添加点位后，可在此设置每站最早到达、最晚完成、停留与优先级。</div>
+      </div>
+    </div>
+
+    <div class="tool-group">
       <button id="computeBtn" class="btn primary big">生成 / 重算巡检路线</button>
       <label class="row check"><input type="checkbox" id="autoRecompute" checked> 编辑后自动重算</label>
     </div>
@@ -104,6 +122,8 @@
       <span><i class="lg l-start"></i>起/终点</span>
       <span><i class="lg l-must"></i>必经点</span>
       <span><i class="lg l-auto"></i>巡检点</span>
+      <span><i class="lg l-wait"></i>等待点</span>
+      <span><i class="lg l-late"></i>逾期点</span>
       <span><i class="lg l-door"></i>门（绿开红闭）</span>
     </div>
   </section>
@@ -119,6 +139,10 @@
         <b id="statCoverage" class="cov">—</b></div>
       <div class="stat"><span>未覆盖面积</span><b id="statUncovered">—</b></div>
       <div class="stat"><span>受阻路段</span><b id="statBlocked">—</b></div>
+      <div class="stat sched-only" hidden><span>班次</span><b id="statShift">—</b></div>
+      <div class="stat sched-only" hidden><span>预计交岗</span><b id="statFinish">—</b></div>
+      <div class="stat sched-only" hidden><span>等待</span><b id="statWait">—</b></div>
+      <div class="stat sched-only" hidden><span>超窗</span><b id="statLate">—</b></div>
       <div class="hint" id="incInfo"></div>
     </div>
 
@@ -135,6 +159,11 @@
       <label class="row check"><input type="checkbox" class="layer" data-layer="route" checked> 路线与方向</label>
       <label class="row check"><input type="checkbox" class="layer" data-layer="uncovered" checked> 未覆盖区域</label>
       <label class="row check"><input type="checkbox" class="layer" data-layer="grid"> 栅格</label>
+    </div>
+
+    <div class="tool-group sched-only" id="timelineGroup" hidden>
+      <h3>班次时间轴（点击展开）</h3>
+      <div id="timeline"></div>
     </div>
 
     <div class="tool-group">

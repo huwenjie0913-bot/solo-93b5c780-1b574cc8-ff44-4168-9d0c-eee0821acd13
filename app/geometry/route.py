@@ -22,6 +22,7 @@ from .gridcache import get_grid
 from .graph import (astar, diagnose, distance_field, label_components,
                     snap_point)
 from .planner import generate_candidates, optimize_order, partition_balance
+from . import schedule as sch
 
 DEFAULT_PPM = 40.0          # 未校准时 1m = 40px
 WALK_SPEED_MPS = 1.2        # 预计用时的默认步行速度
@@ -113,6 +114,20 @@ def build_route(plan: dict) -> dict:
     k = _workers(plan)
     individual = k >= 2 and _start_mode(plan) == "individual"
 
+    # 班次时间窗参数校验（无效 HH:MM / 自相矛盾的窗口）
+    shift = sch.shift_start_minutes(plan)
+    raw_shift = (plan.get("settings") or {}).get("shiftStart")
+    if raw_shift not in (None, "") and shift is None:
+        warnings.append(f"班次开始时间「{raw_shift}」格式无效，已按不排程处理"
+                        "（应为 HH:MM）")
+        shift = None
+    windows = sch.point_windows(plan, shift) if shift is not None else {}
+    if shift is not None:
+        for raw in plan.get("mustPass", []):
+            c = sch.window_conflict(raw, shift)
+            if c:
+                warnings.append(c)
+
     # 1) 固定点：起点 / 必经点 / 终点（多人独立模式下共享起终点不参与）
     start_rec = end_rec = None
     must_recs: list[dict] = []
@@ -139,6 +154,10 @@ def build_route(plan: dict) -> dict:
         r = snap(p, "must")
         if r:
             must_recs.append(r)
+            # 时间窗字段透传到吸附后的记录
+            for fld in ("readyClock", "dueClock", "dwellSeconds", "priority"):
+                if p.get(fld) is not None:
+                    r[fld] = p[fld]
     if individual:
         pass
     elif plan.get("end"):
@@ -190,7 +209,8 @@ def build_route(plan: dict) -> dict:
         starts = worker_starts if individual else [start_rec] * k
         ends = worker_ends if individual else [end_rec] * k
         return _build_multi(plan, blocked, reason, gw, gh, cell, ppm, comp,
-                            starts, ends, must_recs, auto_recs, warnings, t0)
+                            starts, ends, must_recs, auto_recs, warnings, t0,
+                            shift, windows)
 
     # 4) 单人：序列 [start] + (must + auto) + [end]，端点固定做 2-opt
     middle = must_recs + auto_recs
@@ -205,17 +225,77 @@ def build_route(plan: dict) -> dict:
         r["seq"] = new_i + 1
         ordered.append(r)
 
+    # 时间窗排程：按班次时刻与点位约束重排锚点（起终点 + 必经点）
+    if shift is not None:
+        ordered, sw = _reorder_single(plan, ordered, blocked, gw, gh,
+                                      cell, ppm, windows)
+        warnings.extend(sw)
+
     # 必经点顺序可能被优化调整；保留原始必经次序信息由前端 label 呈现
     result = _connect_segments(plan, ordered, blocked, reason, gw, gh, cell, ppm, comp)
     result["warnings"] = warnings + result["warnings"]
     result["coverage"] = _coverage(ordered, result["segments"], blocked, comp,
                                    gw, gh, cell, ppm, spacing)
     result["points"] = ordered
+    if shift is not None:
+        sim = sch.simulate(ordered, result["segments"], plan, shift, windows)
+        _attach_schedule(result, ordered, sim, warnings)
     result["gridInfo"] = {"gw": gw, "gh": gh, "cellPx": round(cell, 2)}
     result["cache"] = _make_cache(plan, gw, gh, cell, ordered, result["segments"])
     result["incremental"] = {"mode": "full"}
     result["elapsedMs"] = int((time.time() - t0) * 1000)
     return result
+
+
+def _reorder_single(plan, ordered, blocked, gw, gh, cell, ppm, windows):
+    """单人路线：带时间窗的锚点重排，返回 (可能重排后的记录, 警告列表)。"""
+    warns: list[str] = []
+    anchor_pos = [i for i, r in enumerate(ordered)
+                  if r.get("kind") in ("start", "end", "must")]
+    anchors = [ordered[i] for i in anchor_pos]
+    if len(anchors) > sch.MAX_REORDER_ANCHORS:
+        warns.append(
+            f"必经点共 {len(anchors)} 个，超过单次时间窗重排上限 "
+            f"{sch.MAX_REORDER_ANCHORS}，访问顺序保持按距离编排，仅逐站核算时刻")
+        return ordered, warns
+
+    perm, why, _, _ = sch.plan_anchor_order(
+        anchors, blocked, gw, gh, cell, ppm, windows, _dwell(plan))
+    if why == "reorder" and perm != list(range(len(anchors))):
+        ordered = sch.apply_anchor_permutation(ordered, perm, anchors)
+        reordered = [anchors[i].get("label") or anchors[i]["id"]
+                     for i in perm if anchors[i].get("kind") == "must"]
+        warns.append("已按时间窗重排必经点访问顺序：" + " → ".join(reordered))
+    return ordered, warns
+
+
+def _attach_schedule(result, records, sim, warnings):
+    """把仿真时刻合并到点位记录，并在结果上挂 schedule 汇总。"""
+    by_id = {e["id"]: e for e in sim["entries"]}
+    for r in records:
+        e = by_id.get(r["id"])
+        if e:
+            r["schedule"] = {k: e[k] for k in (
+                "arrivalClock", "leaveClock", "arrivalMin", "leaveMin",
+                "waitMin", "walkMin", "dwellSeconds", "lateMin",
+                "readyClock", "dueClock", "priority", "windowed",
+                "estimated", "blockedIn") if k in e}
+    result["schedule"] = sim
+    result["stats"].update({
+        "shiftStart": sim["summary"]["shiftStart"],
+        "finishClock": sim["summary"]["finishClock"],
+        "waitMinutes": sim["summary"]["waitMinutes"],
+        "waitPoints": sim["summary"]["waitPoints"],
+        "lateMinutes": sim["summary"]["lateMinutes"],
+        "latePoints": sim["summary"]["latePoints"],
+        "scheduleFeasible": sim["summary"]["feasible"],
+    })
+    # 无效窗口的提示已在 build_route 入口统一生成，这里只补逾期/不可达
+    for c in sim["conflicts"]:
+        if c["type"] == "late":
+            warnings.append("排程逾期：" + c["message"])
+        elif c["type"] == "unreachable":
+            warnings.append("排程不可达：" + c["message"])
 
 
 def _empty_result(plan, gw, gh, cell, blocked, reason, comp, warnings, t0):
@@ -239,7 +319,8 @@ def _empty_result(plan, gw, gh, cell, blocked, reason, comp, warnings, t0):
 # ---------------------------------------------------------------------------
 
 def _build_multi(plan, blocked, reason, gw, gh, cell, ppm, comp,
-                 starts, ends, must_recs, auto_recs, warnings, t0):
+                 starts, ends, must_recs, auto_recs, warnings, t0,
+                 shift=None, windows=None):
     """把自动巡检点与必经点分成负载均衡的 k 条路线并汇总结果。"""
     k = len(starts)
     dwell = _dwell(plan)
@@ -269,8 +350,35 @@ def _build_multi(plan, blocked, reason, gw, gh, cell, ppm, comp,
 
     _rebalance(plan, routes, locked, blocked, reason, gw, gh, cell, ppm, comp)
 
+    # 时间窗排程：各组在几何均衡完成后按窗口重排锚点并重连路段
+    if shift is not None:
+        for i, rt in enumerate(routes):
+            records = rt["records"]
+            anchor_pos = [j for j, r in enumerate(records)
+                          if r.get("kind") in ("start", "end", "must")]
+            anchors = [records[j] for j in anchor_pos]
+            if len(anchors) > sch.MAX_REORDER_ANCHORS:
+                warnings.append(
+                    f"人员 {i + 1} 必经点超过 {sch.MAX_REORDER_ANCHORS} 个，"
+                    "顺序保持按距离编排，仅逐站核算时刻")
+                continue
+            perm, why, _, _ = sch.plan_anchor_order(
+                anchors, blocked, gw, gh, cell, ppm, windows, dwell)
+            if why == "reorder" and perm != list(range(len(anchors))):
+                new_records = sch.apply_anchor_permutation(records, perm, anchors)
+                rt["records"] = new_records
+                rt["group"] = [r for r in new_records
+                               if r.get("kind") not in ("start", "end")]
+                rt["conn"] = _connect_segments(plan, new_records, blocked, reason,
+                                               gw, gh, cell, ppm, comp)
+                names = " → ".join(
+                    anchors[j].get("label") or anchors[j]["id"]
+                    for j in perm if anchors[j].get("kind") == "must")
+                warnings.append(f"人员 {i + 1} 已按时间窗重排：{names}")
+
     return _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell,
-                           ppm, _spacing(plan), warnings, t0, {"mode": "full"})
+                           ppm, _spacing(plan), warnings, t0, {"mode": "full"},
+                           shift, windows)
 
 
 def _locked_map(plan, k, valid_ids=None):
@@ -390,7 +498,8 @@ def _rebalance(plan, routes, locked_ids, blocked, reason, gw, gh, cell, ppm, com
 
 
 def _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell, ppm,
-                    spacing, warnings, t0, incremental):
+                    spacing, warnings, t0, incremental,
+                    shift=None, windows=None):
     """汇总各人员路线：routes 元信息 + 拍平 points/segments + 全队统计。"""
     k = len(routes)
     max_min = _max_minutes(plan)
@@ -399,15 +508,38 @@ def _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell, ppm,
     routes_meta: list[dict] = []
     blocked_count = 0
     overtime_count = 0
+    sim_results: list[dict] = []
 
     for i, rt in enumerate(routes):
         conn = rt["conn"]
         st = conn["stats"]
+
+        # 时间窗排程：逐人到达/离开/等待/超窗仿真
+        sim = None
+        sched_by_id: dict[str, dict] = {}
+        if shift is not None:
+            sim = sch.simulate(rt["records"], conn["segments"], plan, shift,
+                               windows, worker=i)
+            sim_results.append(sim)
+            sched_by_id = {e["id"]: e for e in sim["entries"]}
+            for c in sim["conflicts"]:
+                if c["type"] == "late":
+                    warnings.append(f"人员 {i + 1} 排程逾期：" + c["message"])
+                elif c["type"] == "unreachable":
+                    warnings.append(f"人员 {i + 1} 排程不可达：" + c["message"])
+
         for r in rt["records"]:
             p = dict(r)
             p["worker"] = i
             if r["id"] in locked:
                 p["locked"] = True
+            e = sched_by_id.get(r["id"])
+            if e:
+                p["schedule"] = {kk: e[kk] for kk in (
+                    "arrivalClock", "leaveClock", "arrivalMin", "leaveMin",
+                    "waitMin", "walkMin", "dwellSeconds", "lateMin",
+                    "readyClock", "dueClock", "priority", "windowed",
+                    "estimated", "blockedIn") if kk in e}
             all_points.append(p)
         for s in conn["segments"]:
             seg = dict(s)
@@ -428,13 +560,25 @@ def _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell, ppm,
         if not rt["records"]:
             rt_warnings.append(f"人员 {i + 1} 未分配到点位")
         warnings.extend(rt_warnings)
+        meta_stats = {**st, "overtime": overtime}
+        if sim is not None:
+            meta_stats.update({
+                "shiftStart": sim["summary"]["shiftStart"],
+                "finishClock": sim["summary"]["finishClock"],
+                "waitMinutes": sim["summary"]["waitMinutes"],
+                "waitPoints": sim["summary"]["waitPoints"],
+                "lateMinutes": sim["summary"]["lateMinutes"],
+                "latePoints": sim["summary"]["latePoints"],
+                "scheduleFeasible": sim["summary"]["feasible"],
+            })
         routes_meta.append({
             "worker": i,
             "label": f"人员 {i + 1}",
             "color": WORKER_COLORS[i % len(WORKER_COLORS)],
-            "stats": {**st, "overtime": overtime},
+            "stats": meta_stats,
             "warnings": rt_warnings,
             "blockedSegments": conn["blockedSegments"],
+            "schedule": sim,
         })
 
     total_m = sum(rt["conn"]["stats"]["totalLengthM"] for rt in routes)
@@ -453,6 +597,19 @@ def _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell, ppm,
         "maxMinutes": max_min or None,
     }
 
+    team_schedule = None
+    if shift is not None and sim_results:
+        team_schedule = sch.aggregate_simulations(sim_results)
+        stats.update({
+            "shiftStart": team_schedule["summary"]["shiftStart"],
+            "finishClock": team_schedule["summary"]["finishClock"],
+            "waitMinutes": team_schedule["summary"]["waitMinutes"],
+            "waitPoints": team_schedule["summary"]["waitPoints"],
+            "lateMinutes": team_schedule["summary"]["lateMinutes"],
+            "latePoints": team_schedule["summary"]["latePoints"],
+            "scheduleFeasible": team_schedule["summary"]["feasible"],
+        })
+
     return {
         "mode": "multi",
         "workers": k,
@@ -461,6 +618,7 @@ def _assemble_multi(plan, routes, locked, blocked, comp, gw, gh, cell, ppm,
         "segments": all_segments,
         "blockedSegments": [s["seq"] for s in all_segments if s.get("blocked")],
         "warnings": warnings,
+        "schedule": team_schedule,
         "coverage": _coverage(all_points, all_segments, blocked, comp,
                               gw, gh, cell, ppm, spacing),
         "stats": stats,
@@ -706,7 +864,7 @@ def update_route(plan: dict, cache: dict, edits: dict) -> dict:
     if moved:
         warnings.append("点已自动吸附到最近可通行位置")
 
-    return {
+    result = {
         "points": records,
         "segments": merged,
         "blockedSegments": blocked_segments,
@@ -718,3 +876,15 @@ def update_route(plan: dict, cache: dict, edits: dict) -> dict:
         "incremental": {"mode": "partial", "recalculatedSegments": sorted(affected)},
         "elapsedMs": int((time.time() - t0) * 1000),
     }
+
+    # 拖动点位后同样重算时间窗排程时刻（顺序不变，仅时刻随路段变化）
+    inc_shift = sch.shift_start_minutes(plan)
+    if inc_shift is not None:
+        windows = sch.point_windows(plan, inc_shift)
+        for raw in plan.get("mustPass", []):
+            c = sch.window_conflict(raw, inc_shift)
+            if c:
+                warnings.append(c)
+        sim = sch.simulate(records, merged, plan, inc_shift, windows)
+        _attach_schedule(result, records, sim, warnings)
+    return result

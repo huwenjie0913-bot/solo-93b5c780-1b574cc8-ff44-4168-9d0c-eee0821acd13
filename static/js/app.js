@@ -63,6 +63,18 @@
       scheduleRecompute(true);
     });
 
+    // 班次 / 多人 / 时间窗参数
+    $("shiftStart").addEventListener("change", (e) => {
+      const v = e.target.value;
+      State.data.settings.shiftStart = v || null;
+      scheduleRecompute(true);
+    });
+    $("workers").addEventListener("change", (e) => {
+      State.data.settings.workers = Math.max(1, Math.min(8, parseInt(e.target.value, 10) || 1));
+      e.target.value = State.data.settings.workers;
+      scheduleRecompute(true);
+    });
+
     // 图层
     document.querySelectorAll(".layer").forEach((cb) => {
       cb.addEventListener("change", () => {
@@ -150,7 +162,11 @@
         label: kind === "start" ? "起点" : kind === "end" ? "终点" : "必经点" };
       if (kind === "start") State.data.start = rec;
       else if (kind === "end") State.data.end = rec;
-      else State.data.mustPass.push(rec);
+      else {
+        // 时间窗字段缺省：最早/最晚留空、停留用全局、优先级 3
+        rec.priority = 3;
+        State.data.mustPass.push(rec);
+      }
       scheduleRecompute(true);
     },
 
@@ -339,6 +355,8 @@
   function scheduleRecompute(geomChanged) {
     if (geomChanged) State.markDirty();
     CanvasView.draw();
+    // 必经点增删/班次字段变化时，立即同步编辑面板
+    if (typeof renderMustWindows === "function") renderMustWindows();
     if (!$("autoRecompute").checked) return;
     clearTimeout(recomputeTimer);
     recomputeTimer = setTimeout(() => recompute(false), 350);
@@ -389,7 +407,13 @@
     renderStats(res);
     renderMessages(res);
     renderPointList(res);
+    renderMustWindows();
+    renderTimeline(res);
     CanvasView.draw();
+  }
+
+  function hasSchedule(r) {
+    return !!(r && r.stats && r.stats.shiftStart);
   }
 
   function renderStats(r) {
@@ -404,6 +428,19 @@
     $("statBlocked").textContent = s.blockedCount
       ? `${s.blockedCount} 段` : "0";
     $("statBlocked").style.color = s.blockedCount ? "var(--danger)" : "";
+
+    const on = hasSchedule(r);
+    document.querySelectorAll(".sched-only").forEach((el) => { el.hidden = !on; });
+    if (on) {
+      $("statShift").textContent = s.shiftStart;
+      $("statFinish").textContent = s.finishClock || "—";
+      $("statWait").textContent = `${s.waitMinutes || 0} 分 / ${s.waitPoints || 0} 站`;
+      $("statWait").style.color = s.waitPoints ? "#0e7490" : "";
+      $("statLate").textContent = s.latePoints
+        ? `${s.latePoints} 站 / ${s.lateMinutes} 分` : "0";
+      $("statLate").style.color = s.latePoints ? "var(--danger)" : "";
+    }
+
     const inc = r.incremental;
     $("incInfo").textContent = inc?.mode === "partial"
       ? `增量更新：仅重算 ${inc.recalculatedSegments.map((i) => i + 1).join("、") || "无"} 段，${r.elapsedMs}ms`
@@ -427,22 +464,183 @@
         add(`路段 ${s.fromSeq}→${s.toSeq} 不通：${s.reason.summary}`, "err");
       }
     }
+    // 排程冲突点与原因（无可行顺序时逐站列出）
+    const conflicts = r.schedule?.conflicts || [];
+    const seen = new Set();
+    for (const c of conflicts) {
+      if (seen.has(c.message)) continue;
+      seen.add(c.message);
+      const who = c.worker != null ? `人员 ${c.worker + 1} ` : "";
+      add(`⏰ ${who}${c.message}`, c.type === "late" ? "err" : "warn");
+    }
     if (!ul.children.length) add("路线计算完成", "ok");
   }
 
   function renderPointList(r) {
     const ol = $("pointList");
     ol.innerHTML = "";
+    const schedById = {};
+    for (const e of r.schedule?.entries || []) schedById[e.id] = e;
     for (const p of r.points) {
       const li = document.createElement("li");
       const blocked = (r.segments || []).some(
         (s) => s.blocked && (s.from === p.id || s.to === p.id));
+      const sc = schedById[p.id];
       if (blocked) li.className = "blocked";
+      if (sc?.lateMin > 0) li.classList.add("late");
+      else if (sc?.waitMin > 0) li.classList.add("waiting");
       const tag = { start: "起点", end: "终点", must: "必经", auto: "巡检点" }[p.kind];
-      li.innerHTML = `${p.seq}. ${p.label || p.id}<span class="tag">${tag}${blocked ? " · 相邻路段不通" : ""}</span>`;
+      const clock = sc ? `<span class="tag">${sc.arrivalClock}${sc.lateMin > 0 ? " ⚠超" + Math.ceil(sc.lateMin) + "分" : sc.waitMin > 0 ? " 等" + Math.round(sc.waitMin) + "分" : ""}</span>` : "";
+      li.innerHTML = `${p.worker != null ? `<span class="tag">P${p.worker + 1}</span>` : ""}${p.seq}. ${p.label || p.id}<span class="tag">${tag}${blocked ? " · 相邻路段不通" : ""}</span>${clock}`;
       li.addEventListener("click", () => CanvasView.focusPoint(p.id));
       ol.appendChild(li);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 必经点时间窗编辑面板
+  // -------------------------------------------------------------------------
+  function renderMustWindows() {
+    const box = $("mustWindows");
+    const musts = State.data.mustPass || [];
+    if (!musts.length) {
+      box.innerHTML = '<div class="hint">用 ⭐ 必经点 工具在图上添加点位后，可在此设置每站最早到达、最晚完成、停留与优先级。</div>';
+      return;
+    }
+    const schedById = {};
+    for (const e of State.route?.schedule?.entries || []) schedById[e.id] = e;
+    box.innerHTML = "";
+    for (const m of musts) {
+      const sc = schedById[m.id];
+      const card = document.createElement("div");
+      card.className = "must-card" + (sc?.lateMin > 0 ? " late" : "")
+        + (State.ui.selectedPoint === m.id ? " sel" : "");
+      const dwellVal = m.dwellSeconds != null ? m.dwellSeconds : "";
+      card.innerHTML = `
+        <div class="mc-head">
+          <span class="mc-name">⭐ ${m.label || m.id}</span>
+          <button class="mc-del" title="删除该必经点">✕</button>
+        </div>
+        <div class="mc-grid">
+          <span>最早到达</span><input type="time" data-f="readyClock" step="60" value="${m.readyClock || ""}">
+          <span>最晚完成</span><input type="time" data-f="dueClock" step="60" value="${m.dueClock || ""}">
+          <span>停留(秒)</span><input type="number" min="0" step="10" data-f="dwellSeconds" value="${dwellVal}" placeholder="默认">
+          <span>优先级</span><input type="number" min="1" max="5" step="1" data-f="priority" value="${m.priority ?? 3}">
+        </div>
+        ${sc ? `<div class="mc-flag ${sc.lateMin > 0 ? "late" : sc.waitMin > 0 ? "wait" : ""}">
+          计划 ${sc.arrivalClock}–${sc.leaveClock}
+          ${sc.waitMin > 0 ? `· 等待 ${Math.round(sc.waitMin)} 分` : ""}
+          ${sc.lateMin > 0 ? `· 逾期 ${Math.ceil(sc.lateMin)} 分` : ""}
+          ${m.readyClock || m.dueClock ? `· 窗口 ${m.readyClock || "—"}~${m.dueClock || "—"}` : ""}
+        </div>` : ""}`;
+      card.querySelector(".mc-name").addEventListener("click", () => {
+        const name = prompt("点位名称", m.label || "");
+        if (name !== null) { m.label = name || m.id; scheduleRecompute(false); }
+      });
+      card.querySelector(".mc-del").addEventListener("click", () => {
+        State.data.mustPass = State.data.mustPass.filter((x) => x !== m);
+        scheduleRecompute(true);
+      });
+      card.querySelectorAll("input").forEach((inp) => {
+        inp.addEventListener("click", (e) => e.stopPropagation());
+        inp.addEventListener("change", () => {
+          const f = inp.dataset.f;
+          if (f === "readyClock" || f === "dueClock") m[f] = inp.value || null;
+          else if (f === "dwellSeconds") m[f] = inp.value === "" ? null : Math.max(0, parseFloat(inp.value) || 0);
+          else m[f] = Math.max(1, Math.min(5, parseInt(inp.value, 10) || 3));
+          scheduleRecompute(false);
+        });
+      });
+      card.addEventListener("click", () => CanvasView.focusPoint(m.id));
+      box.appendChild(card);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 班次时间轴
+  // -------------------------------------------------------------------------
+  function renderTimeline(r) {
+    const tl = $("timeline");
+    if (!hasSchedule(r)) { tl.innerHTML = ""; return; }
+    const mode = r.mode === "multi";
+    const groups = [];
+    if (mode) {
+      for (const rt of r.routes || []) {
+        groups.push({
+          title: rt.label, color: rt.color,
+          sim: rt.schedule,
+        });
+      }
+    } else {
+      groups.push({ title: "全班（单人）", color: "#2563eb", sim: r.schedule });
+    }
+
+    const s = r.stats;
+    const badge = s.scheduleFeasible
+      ? '<span class="tl-badge ok">✓ 全部在窗</span>'
+      : '<span class="tl-badge bad">✗ 存在超窗/受阻</span>';
+    let html = `<div class="tl-head">
+      ${badge}
+      <span>班次 <b>${s.shiftStart}</b></span>
+      <span>交岗 <b>${s.finishClock}</b></span>
+      <span>等待 <b>${s.waitMinutes || 0} 分</b>（${s.waitPoints || 0} 站）</span>
+      <span style="color:${s.latePoints ? "var(--danger)" : ""}">超窗 <b>${s.lateMinutes || 0} 分</b>（${s.latePoints || 0} 站）</span>
+    </div>`;
+
+    for (const g of groups) {
+      const sim = g.sim;
+      if (!sim) continue;
+      const end = Math.max(sim.summary.finishMin, 1);
+      // 甘特条：每站 [入站步行, 等待, 服务]
+      let bars = "";
+      for (const e of sim.entries) {
+        const startSrv = e.arrivalMin + e.waitMin;
+        const leave = e.leaveMin;
+        const kinds = [
+          ["walk", e.arrivalMin - e.walkMin, e.arrivalMin],
+          ["wait", e.arrivalMin, startSrv],
+          ["svc" + (e.lateMin > 0 ? " late" : ""), startSrv, leave],
+        ];
+        for (const [cls, a, b] of kinds) {
+          if (b <= a) continue;
+          bars += `<span class="tl-seg ${cls}" title="${escapeHtml(e.label)} ${cls}"
+            style="left:${(100 * a / end).toFixed(2)}%;width:${(100 * (b - a) / end).toFixed(2)}%"></span>`;
+        }
+      }
+      const rows = sim.entries.map((e) => {
+        const pt = (r.points || []).find((p) => p.id === e.id && (p.worker ?? null) === (e.worker ?? null));
+        const name = e.label || e.id;
+        const chips = [
+          e.waitMin > 0 ? `<span class="tl-wait-chip">等 ${Math.round(e.waitMin)}′</span>` : "",
+          e.lateMin > 0 ? `<span class="tl-late-chip">超 ${Math.ceil(e.lateMin)}′</span>` : "",
+        ].join("");
+        const win = e.windowed && (e.readyClock || e.dueClock)
+          ? `<div class="tl-windows">窗 ${e.readyClock || "…"}~${e.dueClock || "…"}${e.priority ? ` · P${e.priority}` : ""}</div>` : "";
+        return `<div class="tl-row ${e.lateMin > 0 ? "late" : e.waitMin > 0 ? "waiting" : ""}" data-id="${e.id}">
+          <span>${e.seq}</span>
+          <span>${e.worker != null ? `P${e.worker + 1} ` : ""}${escapeHtml(name)}${chips}${win}</span>
+          <span class="tl-clock">${e.arrivalClock}–${e.leaveClock}</span>
+        </div>`;
+      }).join("");
+      const sm = sim.summary;
+      html += `<details class="tl-worker" ${mode ? "" : "open"}>
+        <summary style="border-left:4px solid ${g.color}">
+          <span>${g.title}</span>
+          <span class="tl-wmeta">${sm.shiftStart}–${sm.finishClock} · 步行 ${sm.walkMinutes}′ · 等待 ${sm.waitMinutes}′${sm.latePoints ? ` · <b style="color:var(--danger)">超窗 ${sm.latePoints} 站</b>` : ""}</span>
+        </summary>
+        <div class="tl-track">${bars}</div>
+        <div class="tl-stations">${rows}</div>
+      </details>`;
+    }
+    tl.innerHTML = html;
+    tl.querySelectorAll(".tl-row").forEach((row) => {
+      row.addEventListener("click", () => CanvasView.focusPoint(row.dataset.id));
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (ch) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
   }
 
   // -------------------------------------------------------------------------
@@ -478,18 +676,26 @@
     }
     syncForms();
     updateCalibInfo();
-    if (State.route) { renderStats(State.route); renderMessages(State.route); renderPointList(State.route); }
+    if (State.route) {
+      renderStats(State.route); renderMessages(State.route);
+      renderPointList(State.route);
+      renderMustWindows();
+      renderTimeline(State.route);
+    }
     else renderEmpty();
     CanvasView.draw();
   }
 
   function syncForms() {
     const d = State.data;
+    d.settings ??= {};
     $("spacing").value = d.settings.spacing;
     $("margin").value = d.settings.margin;
     $("dwell").value = d.settings.dwell;
     $("threshold").value = d.settings.threshold || 128;
     $("thresholdVal").textContent = d.settings.threshold || 128;
+    $("shiftStart").value = d.settings.shiftStart || "";
+    $("workers").value = d.settings.workers || 1;
   }
 
   function renderEmpty() {
@@ -498,7 +704,10 @@
     $("statBlocked").textContent = "0";
     $("messages").innerHTML = "";
     $("pointList").innerHTML = "";
+    $("timeline").innerHTML = "";
     $("incInfo").textContent = "";
+    document.querySelectorAll(".sched-only").forEach((el) => { el.hidden = true; });
+    renderMustWindows();
   }
 
   async function newPlan() {
@@ -590,6 +799,8 @@
         ["方案", "name"], ["总里程(m)", "totalLengthM"], ["用时(分)", "etaMinutes"],
         ["点位数", "pointCount"], ["覆盖率(%)", "coveragePercent"],
         ["未覆盖(m²)", "uncoveredAreaM2"], ["受阻段", "blockedCount"],
+        ["班次", "shiftStart"], ["交岗", "finishClock"],
+        ["等待(分)", "waitMinutes"], ["超窗(分)", "lateMinutes"],
         ["墙", "walls"], ["门", "doors"], ["禁入区", "zones"],
       ];
       $("compareTable").innerHTML = `<table class="compare"><thead><tr>${

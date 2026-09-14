@@ -227,13 +227,21 @@ def register_routes(app: Flask) -> None:
 def _route_summary(route: dict | None) -> dict:
     if not route:
         return {}
+    stats = route.get("stats") or {}
     return {
-        "totalLengthM": (route.get("stats") or {}).get("totalLengthM"),
-        "etaMinutes": (route.get("stats") or {}).get("etaMinutes"),
-        "pointCount": (route.get("stats") or {}).get("pointCount"),
+        "totalLengthM": stats.get("totalLengthM"),
+        "etaMinutes": stats.get("etaMinutes"),
+        "pointCount": stats.get("pointCount"),
         "coveragePercent": (route.get("coverage") or {}).get("percent"),
-        "blockedCount": (route.get("stats") or {}).get("blockedCount"),
+        "blockedCount": stats.get("blockedCount"),
         "uncoveredAreaM2": (route.get("coverage") or {}).get("uncoveredAreaM2"),
+        # 时间窗排程关键指标（旧快照无 schedule → None，前端显示 —）
+        "shiftStart": stats.get("shiftStart"),
+        "finishClock": stats.get("finishClock"),
+        "waitMinutes": stats.get("waitMinutes"),
+        "lateMinutes": stats.get("lateMinutes"),
+        "latePoints": stats.get("latePoints"),
+        "scheduleFeasible": stats.get("scheduleFeasible"),
     }
 
 

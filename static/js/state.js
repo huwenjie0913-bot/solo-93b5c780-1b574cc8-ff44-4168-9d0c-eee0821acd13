@@ -29,15 +29,30 @@ function defaultData() {
     name: "未命名方案",
     image: null,
     calibration: { pixelsPerMeter: 40, line: null, realMeters: null, calibrated: false },
-    settings: { spacing: 6, margin: 0.3, dwell: 30, threshold: 128 },
+    settings: {
+      spacing: 6, margin: 0.3, dwell: 30, threshold: 128,
+      workers: 1, maxMinutes: 0, startMode: "shared",
+      shiftStart: null,   // "HH:MM"；null=不排程（旧方案行为）
+    },
     walls: [], doors: [], windows: [], zones: [],
     start: null, end: null, mustPass: [],
+    workerStarts: [], workerEnds: [], assignments: {},
     createdAt: Date.now(),
   };
 }
 
 // 哪些几何元素参与栅格化（编辑后需要全量重算）
 const GEOM_KEYS = ["walls", "doors", "windows", "zones", "image", "calibration", "settings"];
+
+// 班次时钟 "HH:MM"（可跨午夜）→ 班次相对分钟；非法返回 null
+function clockToOffset(clock, shiftClock) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((clock || "").trim());
+  const s = /^(\d{1,2}):(\d{2})$/.exec((shiftClock || "").trim());
+  if (!m || !s) return null;
+  const t = +m[1] * 60 + +m[2], base = +s[1] * 60 + +s[2];
+  if (+m[1] > 24 || +m[2] > 59) return null;
+  return (t - base + 1440) % 1440;
+}
 
 State.init = function () {
   this.data = defaultData();

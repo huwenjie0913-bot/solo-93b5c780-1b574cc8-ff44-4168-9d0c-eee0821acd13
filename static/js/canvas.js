@@ -23,7 +23,23 @@
     occ: "rgba(17,24,39,.35)",
     calib: "#7c3aed",
     draft: "#9ca3af",
+    wait: "#0891b2",   // 等待点（青色）
+    late: "#dc2626",   // 逾期点（红色）
   };
+  // 与后端 WORKER_COLORS 保持一致
+  const WORKER_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#d97706",
+    "#7c3aed", "#0891b2", "#db2777", "#65a30d"];
+
+  function schedById() {
+    const m = new Map();
+    for (const e of State.route?.schedule?.entries || []) m.set(e.id + "#" + (e.worker ?? ""), e);
+    return m;
+  }
+
+  function schedOf(p) {
+    return (State.route?.schedule?.entries || []).find(
+      (e) => e.id === p.id && (e.worker ?? null) === (p.worker ?? null));
+  }
 
   let drag = null; // {kind:'new'|'move'|'pan', ...}
 

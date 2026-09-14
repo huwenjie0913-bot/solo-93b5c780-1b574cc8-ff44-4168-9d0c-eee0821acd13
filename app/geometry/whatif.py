@@ -112,16 +112,76 @@ def normalize_scenario(sc: dict | None) -> dict:
     }
 
 
-def apply_scenario(plan: dict, scenario: dict) -> tuple[dict, list[str]]:
-    """把场景叠加到方案副本上，返回 (variant_plan, 处理说明)。"""
+def _window_overlaps_patrol(sc: dict, route: dict, plan: dict) -> bool | None:
+    """封路时段是否与本班巡检时间区间相交。无班次信息返回 None（无法判定）。"""
+    start_clock, end_clock = sc.get("effectiveStart"), sc.get("effectiveEnd")
+    if not start_clock or not end_clock:
+        return None
+    shift = sch.shift_start_minutes(plan)
+    if shift is None:
+        return None
+    s1 = sch.clock_offset(start_clock, shift)
+    e1 = sch.clock_offset(end_clock, shift)
+    if e1 <= s1:
+        e1 += 1440
+    finish = (route.get("stats") or {}).get("finishClock")
+    s2, e2 = 0.0, None
+    if finish:
+        e2 = sch.clock_offset(finish, shift)
+        if e2 <= 0:
+            e2 += 1440
+    if e2 is None:
+        e2 = 1440
+    return s1 < e2 and s2 < e1
+
+
+def active_closures(scenario: dict, plan: dict,
+                    baseline: dict | None) -> tuple[list[dict], list[dict]]:
+    """按生效时段把封闭通道分成 (参与计算, 错峰不参与)。
+
+    规则：
+    - 未设置班次开始时间、通道未设生效时段、或无法取得基线交岗时刻 →
+      无法判定，保守地让通道参与计算（不误放真实隔断）；
+    - 否则通道仅在与「班次开始 → 基线预计交岗」区间重叠时栅格化，
+      错峰通道（如巡逻 08:00 已结束、封路 20:00–21:00）不产生障碍，
+      也就不会出现不可达点/封路冲突。
+    """
+    shift = sch.shift_start_minutes(plan)
+    finish = (baseline or {}).get("stats", {}).get("finishClock")
+    active, idle = [], []
+    for c in scenario.get("closures", []):
+        if shift is None or not c.get("effectiveStart") \
+                or not c.get("effectiveEnd") or not finish:
+            active.append(c)
+            continue
+        overlap = _window_overlaps_patrol(c, baseline, plan)
+        (active if overlap is not False else idle).append(c)
+    return active, idle
+
+
+def apply_scenario(plan: dict, scenario: dict,
+                   baseline: dict | None = None) -> tuple[dict, list[str]]:
+    """把场景叠加到方案副本上，返回 (variant_plan, 处理说明)。
+
+    封闭通道仅在生效时段与路线执行时间重叠时写入临时障碍层
+    （见 :func:`active_closures`）；错峰通道保留在场景中但不参与栅格化。
+    """
     v = copy.deepcopy(plan)
     notes: list[str] = []
+    scenario = normalize_scenario(scenario)
 
     # 1) 封闭通道 → 临时障碍层（不写回 walls，便于基线对照）
+    active, idle = active_closures(scenario, plan, baseline)
+    if idle:
+        for c in idle:
+            notes.append(
+                f"「{c.get('label') or c['id']}」生效时段 "
+                f"{c.get('effectiveStart')}–{c.get('effectiveEnd')} "
+                "与本班巡逻时间不重叠，未参与路线重算")
     v["_tempBlockers"] = [
         {"id": c["id"], "x1": c["x1"], "y1": c["y1"], "x2": c["x2"],
          "y2": c["y2"], "thickness": c["thickness"]}
-        for c in scenario["closures"]
+        for c in active
     ]
 
     # 2) 门控覆盖（推演期间强制关闭/恢复）
@@ -251,9 +311,15 @@ def _path_sim(a_cells: set, b_cells: set) -> float:
 # ---------------------------------------------------------------------------
 
 def compare_routes(base: dict, variant: dict, plan: dict,
-                   variant_plan: dict, scenario: dict) -> dict:
-    """基线 vs 推演：受影响点位、延误、绕行、重复经过、冲突。"""
+                   variant_plan: dict, scenario: dict,
+                   active: list[dict] | None = None) -> dict:
+    """基线 vs 推演：受影响点位、延误、绕行、重复经过、冲突。
+
+    active 为本轮真正参与计算的封闭通道（错峰通道不进入切过判定/高亮）。
+    """
     t0 = time.time()
+    if active is None:
+        active, _ = active_closures(scenario, plan, base)
     base_arr = _arrival_index(base, plan)
     var_arr = _arrival_index(variant, variant_plan)
     base_cells = _point_cells(base)
@@ -375,8 +441,10 @@ def compare_routes(base: dict, variant: dict, plan: dict,
                 "varClock": (var_arr.get(key) or {}).get("clock"),
             })
 
-    # ---- 绕行段 / 封路切过基线路径 ----------------------------------------
-    closure_cells = _closure_cells(plan, scenario)
+    # ---- 绕行段 / 封路切过基线路径（仅参与计算的通道） --------------------
+    active_scenario = dict(scenario)
+    active_scenario["closures"] = active
+    closure_cells = _closure_cells(plan, active_scenario)
     base_blocked_by_closure = _segments_intersecting(base, closure_cells)
     var_segments_diff = _segment_diffs(base_in, var_in, base_chains,
                                        var_chains, cellset)
@@ -662,16 +730,18 @@ def _build_conflicts(scenario, variant, variant_plan, affected, new_points,
             f"（{bcov.get('percent')}% → {vcov.get('percent')}%）",
             key_suffix="plan")
 
-    # 9) 封路时段与本班巡逻时间不重叠（提示，非阻断）
+    # 9) 封路时段与本班巡逻时间不重叠：该通道未参与重算，仅作提示
     shift = sch.shift_start_minutes(variant_plan)
+    active_ids = {c["id"] for c in active_closures(scenario, variant_plan, base)[0]}
     for c in scenario["closures"]:
+        if c["id"] in active_ids:
+            continue
         if shift is None or not c.get("effectiveStart"):
             continue
-        if _window_overlaps_patrol(c, variant, variant_plan) is False:
-            add("low", "outside-shift",
-                f"「{c['label']}」生效时段 {c['effectiveStart']}–"
-                f"{c['effectiveEnd']} 与本班巡逻时段不重叠，本次推演可能不受影响",
-                closureId=c["id"])
+        add("low", "outside-shift",
+            f"「{c['label']}」生效时段 {c['effectiveStart']}–"
+            f"{c['effectiveEnd']} 与本班巡逻时间不重叠，未参与路线重算",
+            closureId=c["id"])
 
     # 去重（同 key 保留严重度最高的一条）
     sev_rank = {"high": 3, "medium": 2, "low": 1}
@@ -699,10 +769,18 @@ def evaluate_scenario(plan: dict, scenario: dict,
     sc = normalize_scenario(scenario)
     t0 = time.time()
     base = baseline if baseline is not None else build_route(plan)
-    variant_plan, notes = apply_scenario(plan, sc)
+    active, idle = active_closures(sc, plan, base)
+    variant_plan, notes = apply_scenario(plan, sc, baseline=base)
     variant = build_route(variant_plan)
 
-    impact = compare_routes(base, variant, plan, variant_plan, sc)
+    impact = compare_routes(base, variant, plan, variant_plan, sc,
+                            active=active)
+    impact["idleClosures"] = [
+        {"id": c["id"], "label": c.get("label") or c["id"],
+         "effectiveStart": c.get("effectiveStart"),
+         "effectiveEnd": c.get("effectiveEnd")}
+        for c in idle
+    ]
 
     # 给推演点位/路段打影响标签，供画布直接上色
     _tag_variant(variant, impact, variant_plan, sc)

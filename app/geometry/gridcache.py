@@ -28,6 +28,11 @@ def geometry_fingerprint(plan: dict) -> str:
                      for w in plan.get("windows", []))),
         tuple(sorted(tuple((p["x"], p["y"]) for p in z["points"])
                      for z in plan.get("zones", []))),
+        tuple(sorted(
+            (b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2"),
+             b.get("thickness"),
+             tuple((p["x"], p["y"]) for p in b.get("points", [])))
+            for b in plan.get("_tempBlockers", []) or [])),
     )
     return repr(key)
 

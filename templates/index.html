@@ -18,6 +18,7 @@
     <button id="saveBtn" class="btn primary">保存方案</button>
   </div>
   <div class="top-actions">
+    <button id="whatifBtn" class="btn" style="background:#7c3aed;border-color:#7c3aed;color:#fff" title="临时封路 / 班次交接推演">🔀 路线变更推演</button>
     <button id="snapBtn" class="btn" title="把当前方案另存为快照，用于对比">📸 另存快照</button>
     <button id="compareBtn" class="btn">⇄ 方案对比</button>
     <button id="printBtn" class="btn">🖨 打印页</button>
@@ -115,6 +116,40 @@
   <section class="canvas-wrap">
     <canvas id="canvas" width="1200" height="800"></canvas>
     <div class="canvas-hud" id="hud"></div>
+
+    <!-- 推演模式：浮动工具条 -->
+    <div class="wf-bar" id="whatifBar" hidden>
+      <div class="wf-bar-title">🔀 路线变更推演</div>
+      <div class="wf-tools" id="whatifTools">
+        <button class="wtool" data-wtool="wselect">↖ 选择/拖动</button>
+        <button class="wtool" data-wtool="closure">🚧 封闭通道</button>
+        <button class="wtool" data-wtool="handover">🔁 交接点</button>
+        <button class="wtool" data-wtool="werase">🧹 删除</button>
+        <span class="wf-sep"></span>
+        <div class="wf-defaults">
+          <label>默认时段
+            <input type="time" id="wfDefaultStart" step="60" value="08:00"> ~
+            <input type="time" id="wfDefaultEnd" step="600" value="12:00">
+          </label>
+          <label>生效日期
+            <input type="date" id="wfValidFrom"> ~
+            <input type="date" id="wfValidTo">
+          </label>
+        </div>
+        <span class="wf-sep"></span>
+        <div class="wf-view">
+          <button class="wf-view-btn" data-view="baseline">基线方案</button>
+          <button class="wf-view-btn active" data-view="variant">推演方案</button>
+        </div>
+        <span class="wf-status" id="whatifStatus"></span>
+      </div>
+      <div class="wf-hint" id="whatifToolHint">选择工具后在画布上操作</div>
+      <div class="wf-bar-actions">
+        <button id="wfReset" class="btn small">清空推演</button>
+        <button id="wfExit" class="btn small">退出推演</button>
+      </div>
+    </div>
+
     <div class="legend">
       <span><i class="lg l-route"></i>路线</span>
       <span><i class="lg l-blocked"></i>受阻路段</span>
@@ -125,11 +160,70 @@
       <span><i class="lg l-wait"></i>等待点</span>
       <span><i class="lg l-late"></i>逾期点</span>
       <span><i class="lg l-door"></i>门（绿开红闭）</span>
+      <span><i class="lg l-closure"></i>封闭通道</span>
+      <span><i class="lg l-handover"></i>交接点</span>
+      <span><i class="lg l-reroute"></i>绕行路段</span>
     </div>
   </section>
 
   <!-- 右侧结果 -->
   <aside class="sidebar right">
+    <!-- 路线变更推演面板 -->
+    <div class="wf-panel" id="whatifPanel" hidden>
+      <div class="tool-group">
+        <h3>🔀 路线变更推演</h3>
+        <label class="row">版本名称
+          <input type="text" id="wfName" class="wf-text" placeholder="推演版本名称">
+        </label>
+        <label class="row col">变更原因
+          <textarea id="wfReason" rows="2" placeholder="如：3号通道叉车吊装，临时封路 4 小时"></textarea>
+        </label>
+      </div>
+
+      <div class="tool-group">
+        <h3>封闭通道与生效时段</h3>
+        <div id="wfClosures" class="wf-list"></div>
+      </div>
+
+      <div class="tool-group">
+        <h3>班次交接点</h3>
+        <div id="wfHandovers" class="wf-list"></div>
+      </div>
+
+      <div class="tool-group">
+        <h3>影响摘要</h3>
+        <div id="wfImpact"><div class="hint">设置封闭通道/交接点后自动推演…</div></div>
+      </div>
+
+      <div class="tool-group">
+        <h3>需人工确认的冲突</h3>
+        <div id="wfConflicts" class="wf-conflicts"></div>
+      </div>
+
+      <div class="tool-group">
+        <h3>受影响巡检点</h3>
+        <div id="wfAffected" class="wf-afflist"></div>
+      </div>
+
+      <div class="tool-group">
+        <h3>推演版本</h3>
+        <div class="wf-ver-actions">
+          <button id="wfSaveNew" class="btn small primary">💾 存为新版本</button>
+          <button id="wfSaveUpd" class="btn small" hidden>更新当前版本</button>
+          <button id="wfConfirmVer" class="btn small">✓ 标记已确认</button>
+        </div>
+        <div id="wfVersions" class="wf-versions"></div>
+      </div>
+
+      <div class="tool-group">
+        <h3>导出</h3>
+        <div class="wf-ver-actions">
+          <button id="wfExportPng" class="btn small" disabled>🖼 路线图 PNG</button>
+          <button id="wfExportMd" class="btn small" disabled>📄 差异说明 MD</button>
+        </div>
+      </div>
+    </div>
+
     <div class="tool-group stats">
       <h3>路线统计</h3>
       <div class="stat"><span>总里程</span><b id="statLength">—</b></div>

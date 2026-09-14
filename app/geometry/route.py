@@ -72,6 +72,8 @@ def _fingerprint(plan: dict) -> str:
         tuple((d["id"], d.get("open", True)) for d in plan.get("doors", [])),
         tuple((w["x1"], w["y1"], w["x2"], w["y2"]) for w in plan.get("walls", [])),
         tuple((z["id"],) for z in plan.get("zones", [])),
+        tuple((b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2"))
+              for b in plan.get("_tempBlockers", []) or []),
     ))
 
 
@@ -135,7 +137,8 @@ def build_route(plan: dict) -> dict:
     def snap(raw, kind):
         s = snap_point(blocked, gw, gh, cell, float(raw["x"]), float(raw["y"]))
         name = raw.get("label") or raw.get("id")
-        kind_name = {"start": "起点", "end": "终点", "must": "必经点"}[kind]
+        kind_name = {"start": "起点", "end": "终点", "must": "必经点",
+                     "handover": "交接点"}.get(kind, kind)
         if s is None:
             warnings.append(f"{kind_name}「{name}」位于封闭区域内且附近无可通行格，已忽略")
             return None
@@ -155,7 +158,8 @@ def build_route(plan: dict) -> dict:
         if r:
             must_recs.append(r)
             # 时间窗字段透传到吸附后的记录
-            for fld in ("readyClock", "dueClock", "dwellSeconds", "priority"):
+            for fld in ("readyClock", "dueClock", "dwellSeconds", "priority",
+                        "role"):
                 if p.get(fld) is not None:
                     r[fld] = p[fld]
     if individual:

@@ -2,13 +2,14 @@
 const State = {
   planId: null,
   data: null,          // 与后端共享的方案 JSON
-  route: null,         // 后端返回的路线结果
+  route: null,         // 后端返回的路线结果（基线）
   planImage: null,     // HTMLImageElement（平面图）
   dirty: false,        // 方案有未计算的几何改动
   suppressAuto: false, // 拖动过程中临时抑制自动重算
+  whatif: null,        // 推演模块状态（null=未开启），见 Whatif.defaultScenario
   ui: {
     tool: "select",
-    layers: { walls: true, zones: true, points: true, route: true, uncovered: true, grid: false },
+    layers: { walls: true, zones: true, points: true, route: true, uncovered: true, grid: false, closures: true, handovers: true },
     showOccupancy: false,
     threshold: 128,
     drawingZone: null,      // 正在绘制的禁入区点集
@@ -18,6 +19,20 @@ const State = {
     selectedPoint: null,
     pan: { x: 0, y: 0 },
   },
+};
+
+// 画布当前应渲染的路线：推演开启且处于「推演」视图时用 variant，否则用基线
+State.activeRoute = function () {
+  const w = this.whatif;
+  if (w && w.open && w.view === "variant" && w.evaluation) {
+    return w.evaluation.variant || this.route;
+  }
+  return this.route;
+};
+
+// 画布当前是否处于推演交互态（用于屏蔽常规几何编辑）
+State.whatifActive = function () {
+  return !!(this.whatif && this.whatif.open);
 };
 
 function uid(prefix) {

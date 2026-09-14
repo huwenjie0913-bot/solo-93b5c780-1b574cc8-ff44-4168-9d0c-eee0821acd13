@@ -19,6 +19,7 @@ REASON_WALL = "wall"
 REASON_WINDOW = "window"
 REASON_ZONE = "zone"
 REASON_DOOR_CLOSED = "closed-door"
+REASON_CLOSURE = "closure"   # 路线推演：临时封闭通道
 
 DEFAULT_MAX_CELLS = 300_000   # gw * gh 上限，保证 A* / BFS 可在数秒内完成
 MIN_CELL = 4.0                # 每格最小像素尺寸（图像坐标），墙线至少占一格
@@ -238,6 +239,22 @@ def carve_open_doors(wall_layer: bytearray, reason: list, doors: Iterable[dict],
 # 总装
 # ---------------------------------------------------------------------------
 
+def rasterize_closure(layer: bytearray, reason: list, gw: int, gh: int,
+                      cell: float, spec: dict,
+                      tag: str = REASON_CLOSURE) -> set[int]:
+    """栅格化一条推演封闭通道（线段），返回被封死的格子集合。
+
+    spec: {x1,y1,x2,y2, thickness}；不规则封路用 {points:[...]}（多边形）。
+    """
+    if spec.get("points"):
+        return rasterize_polygon(layer, reason, gw, gh, spec["points"], cell, tag)
+    return rasterize_line(
+        layer, reason, gw, gh,
+        float(spec["x1"]), float(spec["y1"]),
+        float(spec["x2"]), float(spec["y2"]),
+        float(spec.get("thickness") or 14.0), cell, tag)
+
+
 def build_grid(plan: dict) -> dict:
     """根据方案构建完整栅格。
 
@@ -333,6 +350,15 @@ def build_grid(plan: dict) -> dict:
             blocked[idx] = 1
             final_reason[idx] = REASON_DOOR_CLOSED
 
+    # 推演临时封闭通道：最后压一层，可盖死门洞与普通可通行格（不做安全余量膨胀）
+    closure_layer = bytearray(n)
+    for tmp in plan.get("_tempBlockers", []) or []:
+        rasterize_closure(closure_layer, final_reason, gw, gh, cell, tmp)
+    for idx, v in enumerate(closure_layer):
+        if v:
+            blocked[idx] = 1
+            final_reason[idx] = REASON_CLOSURE
+
     # 外边框一圈视为障碍，避免路径贴着图边走
     for gx in range(gw):
         for gy in (0, gh - 1):
@@ -352,5 +378,6 @@ def build_grid(plan: dict) -> dict:
         "blocked": blocked, "reason": final_reason,
         "image_layer": image_layer, "wall_layer": wall_layer,
         "window_layer": window_layer,
-        "zone_layer": zone_layer, "door_cells": door_cells,
+        "zone_layer": zone_layer, "closure_layer": closure_layer,
+        "door_cells": door_cells,
     }

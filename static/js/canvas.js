@@ -32,12 +32,14 @@
 
   function schedById() {
     const m = new Map();
-    for (const e of State.route?.schedule?.entries || []) m.set(e.id + "#" + (e.worker ?? ""), e);
+    const r = State.activeRoute();
+    for (const e of r?.schedule?.entries || []) m.set(e.id + "#" + (e.worker ?? ""), e);
     return m;
   }
 
   function schedOf(p) {
-    return (State.route?.schedule?.entries || []).find(
+    const r = State.activeRoute();
+    return (r?.schedule?.entries || []).find(
       (e) => e.id === p.id && (e.worker ?? null) === (p.worker ?? null));
   }
 
@@ -90,10 +92,10 @@
     }
 
     // 栅格
-    if (State.ui.layers.grid && State.route?.gridInfo) drawGrid();
+    if (State.ui.layers.grid && State.activeRoute()?.gridInfo) drawGrid();
 
     // 未覆盖区域（路线之下）
-    if (State.ui.layers.uncovered && State.route) drawUncovered();
+    if (State.ui.layers.uncovered && State.activeRoute()) drawUncovered();
 
     // 禁入区
     if (State.ui.layers.zones) drawZones();
@@ -107,11 +109,16 @@
     // 门
     drawDoors();
 
-    // 路线
-    if (State.ui.layers.route && State.route) drawRoute();
+    // 推演叠加层：封闭通道 / 交接点 / 门控覆盖 / 不可达点
+    if (window.Whatif && Whatif.isOpen()) {
+      Whatif.drawOverlays(ctx, W, H, { label, dot, line });
+    }
+
+    // 路线（推演视图下按影响状态着色）
+    if (State.ui.layers.route && State.activeRoute()) drawRoute();
 
     // 点位
-    if (State.ui.layers.points && State.route) drawPoints();
+    if (State.ui.layers.points && State.activeRoute()) drawPoints();
 
     // 校准线
     drawCalib();
@@ -234,7 +241,7 @@
   }
 
   function drawGrid() {
-    const { gw, gh, cellPx } = State.route.gridInfo;
+    const { gw, gh, cellPx } = State.activeRoute().gridInfo;
     const cell = W / gw;
     ctx.strokeStyle = COLORS.grid; ctx.lineWidth = 0.5;
     ctx.beginPath();
@@ -244,9 +251,9 @@
   }
 
   function drawUncovered() {
-    const cov = State.route.coverage;
+    const cov = State.activeRoute().coverage;
     if (!cov?.uncoveredRuns?.length) return;
-    const { gw } = State.route.gridInfo;
+    const { gw } = State.activeRoute().gridInfo;
     const cell = W / gw;
     ctx.fillStyle = COLORS.uncovered;
     for (const [start, len] of cov.uncoveredRuns) {
@@ -258,8 +265,15 @@
     }
   }
 
+  const IMPACT_COLORS = {
+    rerouted: "#d97706",   // 绕行：琥珀
+    blocked: "#dc2626",    // 受阻：红
+  };
+
   function drawRoute() {
-    const segs = State.route.segments || [];
+    const r = State.activeRoute();
+    const segs = r.segments || [];
+    const wfView = window.Whatif && Whatif.isOpen() && State.whatif.view === "variant";
     for (const s of segs) {
       if (s.blocked) {
         // 受阻：红虚线 + 中点诊断标记
@@ -275,21 +289,24 @@
         ctx.fillText("!", mx, my + 0.5);
       } else {
         const pts = s.path;
-        ctx.strokeStyle = COLORS.route; ctx.lineWidth = 3.5;
+        // 推演视图：绕行段琥珀色，其余保持基线蓝
+        ctx.strokeStyle = (wfView && s.impact === "rerouted")
+          ? IMPACT_COLORS.rerouted : COLORS.route;
+        ctx.lineWidth = (wfView && s.impact === "rerouted") ? 4.5 : 3.5;
         ctx.lineJoin = "round"; ctx.lineCap = "round";
         ctx.beginPath();
         ctx.moveTo(pts[0].x, pts[0].y);
         for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
         ctx.stroke();
-        drawArrowHeads(pts);
+        drawArrowHeads(pts, ctx.strokeStyle);
       }
     }
   }
 
-  function drawArrowHeads(pts) {
+  function drawArrowHeads(pts, color) {
     // 每隔若干路径点画一个方向箭头
     const step = Math.max(8, Math.floor(pts.length / Math.max(2, pts.length / 14)));
-    ctx.fillStyle = COLORS.route;
+    ctx.fillStyle = color || COLORS.route;
     for (let i = step; i < pts.length - 2; i += step) {
       const a = pts[i - 3] || pts[i - 1], b = pts[i];
       const ang = Math.atan2(b.y - a.y, b.x - a.x);
@@ -305,17 +322,40 @@
 
   function drawPoints() {
     const sel = State.ui.selectedPoint;
-    for (const p of State.route.points) {
+    const r = State.activeRoute();
+    const wfView = window.Whatif && Whatif.isOpen() && State.whatif.view === "variant";
+    for (const p of r.points) {
       const isSel = sel === p.id;
-      let col = COLORS.auto, r = 6, fill = "#fff";
-      if (p.kind === "start") { col = COLORS.start; fill = COLORS.start; r = 9; }
-      if (p.kind === "end") { col = COLORS.end; fill = COLORS.end; r = 9; }
-      if (p.kind === "must") { col = COLORS.must; fill = COLORS.must; r = 8; }
+      let col = COLORS.auto, r0 = 6, fill = "#fff";
+      if (p.kind === "start") { col = COLORS.start; fill = COLORS.start; r0 = 9; }
+      if (p.kind === "end") { col = COLORS.end; fill = COLORS.end; r0 = 9; }
+      if (p.kind === "must") { col = COLORS.must; fill = COLORS.must; r0 = 8; }
+      if (p.role === "handover") { col = "#7c3aed"; fill = "#7c3aed"; r0 = 8; }
+      // 推演影响环：延误橙、绕行琥珀虚线、受阻红粗环
+      if (wfView && p.impact === "delayed") {
+        ctx.beginPath(); ctx.arc(p.x, p.y, r0 + 5, 0, Math.PI * 2);
+        ctx.strokeStyle = "#ea580c"; ctx.lineWidth = 3; ctx.stroke();
+      } else if (wfView && p.impact === "rerouted") {
+        ctx.beginPath(); ctx.arc(p.x, p.y, r0 + 5, 0, Math.PI * 2);
+        ctx.strokeStyle = IMPACT_COLORS.rerouted; ctx.lineWidth = 2.5;
+        ctx.setLineDash([4, 3]); ctx.stroke(); ctx.setLineDash([]);
+      } else if (wfView && p.impact === "blocked") {
+        ctx.beginPath(); ctx.arc(p.x, p.y, r0 + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = IMPACT_COLORS.blocked; ctx.lineWidth = 3.5; ctx.stroke();
+      }
       ctx.beginPath();
-      ctx.arc(p.x, p.y, r + (isSel ? 3 : 0), 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, r0 + (isSel ? 3 : 0), 0, Math.PI * 2);
       ctx.fillStyle = fill; ctx.fill();
       ctx.lineWidth = 2.5; ctx.strokeStyle = col; ctx.stroke();
-      label(p.x, p.y - r - 7, String(p.seq), col, true);
+      if (p.role === "handover") {
+        ctx.fillStyle = "#fff"; ctx.font = "bold 10px sans-serif";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText("交", p.x, p.y + 0.5);
+      }
+      let txt = String(p.seq);
+      if (wfView && p.impact === "delayed" && p.delayMin > 0)
+        txt += " +" + Math.round(p.delayMin) + "′";
+      label(p.x, p.y - r0 - 7, txt, p.impact === "blocked" ? IMPACT_COLORS.blocked : col, true);
     }
   }
 
@@ -338,9 +378,9 @@
   // 命中测试
   // -------------------------------------------------------------------------
   function hitPoint(p, tol = 12) {
-    if (!State.route) return null;
+    if (!State.activeRoute()) return null;
     let best = null, bd = tol;
-    for (const q of State.route.points) {
+    for (const q of State.activeRoute().points) {
       const d = Math.hypot(p.x - q.x, p.y - q.y);
       if (d < bd) { bd = d; best = q; }
     }
@@ -370,7 +410,7 @@
   }
 
   function hitBlockedMarker(p) {
-    for (const s of State.route?.segments || []) {
+    for (const s of State.activeRoute()?.segments || []) {
       if (!s.blocked) continue;
       const f = s.fallbackPath;
       const mx = (f[0].x + f[1].x) / 2, my = (f[0].y + f[1].y) / 2;
@@ -384,8 +424,16 @@
   // -------------------------------------------------------------------------
   canvas.addEventListener("mousedown", (e) => {
     const p = getPos(e);
-    const tool = State.ui.tool;
     HUD.style.display = "none";
+
+    // 推演模式：交互全部交给 whatif 模块
+    if (window.Whatif && Whatif.isOpen()) {
+      Whatif.onMouseDown(p);
+      draw();
+      return;
+    }
+
+    const tool = State.ui.tool;
 
     // 受阻标记 → 显示诊断
     const bm = hitBlockedMarker(p);
@@ -442,10 +490,20 @@
 
   canvas.addEventListener("mousemove", (e) => {
     const p = getPos(e);
+    // 推演模式
+    if (window.Whatif && Whatif.isOpen()) {
+      if (Whatif.isDragging()) {
+        const cur = Whatif.onMouseMove(p);
+        canvas.style.cursor = cur || "";
+      } else {
+        canvas.style.cursor = Whatif.onMouseMove(p) || "crosshair";
+      }
+      return;
+    }
     if (drag?.kind === "move") {
       drag.current = p;
       // 实时跟随（吸附由后端返回；拖动中先用原始位置）
-      const rec = State.route.points.find((q) => q.id === drag.id);
+      const rec = State.activeRoute().points.find((q) => q.id === drag.id);
       if (rec) { rec.x = p.x; rec.y = p.y; rec._pending = true; }
       draw();
       return;
@@ -465,6 +523,13 @@
   });
 
   window.addEventListener("mouseup", async (e) => {
+    if (window.Whatif && Whatif.isOpen() && Whatif.isDragging()) {
+      const p = getPos(e);
+      await Whatif.onMouseUp(p);
+      canvas.style.cursor = "";
+      draw();
+      return;
+    }
     if (!drag) return;
     if (drag.kind === "new") {
       const p = getPos(e);
@@ -495,9 +560,13 @@
     HUD.style.display = "block";
   }
 
-  // 暴露给 app.js
+  // 暴露给 app.js / whatif.js
   window.CanvasView = {
     draw, setSize, getPos,
+    findDoor: (p, tol) => hitDoor(p, tol ?? 9),
+    findRoutePoint: (p, tol) => hitPoint(p, tol ?? 12),
+    activeRoute: () => State.activeRoute(),
+    canvasSize: () => ({ W, H }),
     closeZoneDraft: () => { State.ui.drawingZone = null; draw(); },
     focusPoint(id) {
       State.ui.selectedPoint = id;

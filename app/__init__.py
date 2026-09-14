@@ -13,6 +13,7 @@ from werkzeug.utils import secure_filename
 
 from . import db
 from .geometry import build_route, update_route
+from .geometry.whatif import evaluate_scenario, impact_text_lines, normalize_scenario
 from .models import default_plan
 
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -213,6 +214,118 @@ def register_routes(app: Flask) -> None:
                              "doors": len(snap["data"].get("doors", [])),
                              "zones": len(snap["data"].get("zones", []))})
         return jsonify({"rows": rows})
+
+    # -- 路线变更推演 --------------------------------------------------------
+
+    @app.post("/api/whatif/evaluate")
+    def api_whatif_eval():
+        """对（未保存的）方案数据直接推演。body: {data, scenario, baseline?}"""
+        payload = request.get_json(force=True, silent=True) or {}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            abort(400, "缺少 data 字段")
+        try:
+            result = evaluate_scenario(data, payload.get("scenario") or {})
+        except Exception as exc:
+            app.logger.exception("what-if evaluate failed")
+            return jsonify({"error": f"推演计算失败：{exc}"}), 500
+        return jsonify(result)
+
+    @app.post("/api/plans/<int:pid>/whatif/evaluate")
+    def api_plan_whatif_eval(pid: int):
+        """基于已保存方案推演（可带 scenarioId 复用已存场景）。"""
+        plan = db.get_plan(pid)
+        if not plan:
+            abort(404)
+        payload = request.get_json(force=True, silent=True) or {}
+        scenario = payload.get("scenario")
+        if scenario is None and payload.get("scenarioId"):
+            saved = db.get_scenario(int(payload["scenarioId"]))
+            if saved and saved["planId"] == pid:
+                scenario = saved["scenario"]
+        try:
+            result = evaluate_scenario(plan["data"], scenario or {})
+        except Exception as exc:
+            app.logger.exception("what-if evaluate failed")
+            return jsonify({"error": f"推演计算失败：{exc}"}), 500
+        return jsonify(result)
+
+    @app.get("/api/plans/<int:pid>/scenarios")
+    def api_scenario_list(pid: int):
+        if not db.get_plan(pid):
+            abort(404)
+        return jsonify({"scenarios": db.list_scenarios(pid)})
+
+    @app.post("/api/plans/<int:pid>/scenarios")
+    def api_scenario_create(pid: int):
+        plan = db.get_plan(pid)
+        if not plan:
+            abort(404)
+        payload = request.get_json(force=True, silent=True) or {}
+        scenario = normalize_scenario(payload.get("scenario") or {})
+        name = (payload.get("name") or scenario.get("name") or "未命名推演").strip()
+        reason = (payload.get("reason") or scenario.get("reason") or "").strip()
+        impact = payload.get("impact")
+        # 保存前重新推演一次，保证影响摘要与当前几何一致
+        if payload.get("reevaluate", True):
+            impact = evaluate_scenario(plan["data"], scenario)["impact"]
+        sid = db.create_scenario(pid, name, reason, scenario, impact,
+                                 payload.get("status") or "draft")
+        return jsonify({"id": sid, **(db.get_scenario(sid) or {})}), 201
+
+    @app.get("/api/scenarios/<int:sid>")
+    def api_scenario_get(sid: int):
+        scen = db.get_scenario(sid)
+        if not scen:
+            abort(404)
+        return jsonify(scen)
+
+    @app.put("/api/scenarios/<int:sid>")
+    def api_scenario_update(sid: int):
+        old = db.get_scenario(sid)
+        if not old:
+            abort(404)
+        payload = request.get_json(force=True, silent=True) or {}
+        plan = db.get_plan(old["planId"])
+        scenario = normalize_scenario(
+            payload.get("scenario") if payload.get("scenario") is not None
+            else old["scenario"])
+        name = payload.get("name")
+        reason = payload.get("reason")
+        impact = payload.get("impact", old.get("impact"))
+        if payload.get("reevaluate"):
+            impact = evaluate_scenario(plan["data"], scenario)["impact"]
+        db.update_scenario(sid, name, reason, scenario, impact,
+                           payload.get("status"))
+        return jsonify(db.get_scenario(sid))
+
+    @app.post("/api/scenarios/<int:sid>/publish")
+    def api_scenario_publish(sid: int):
+        """发布推演版本：标记 published（基线方案本身不被改动）。"""
+        old = db.get_scenario(sid)
+        if not old:
+            abort(404)
+        db.update_scenario(sid, None, None, old["scenario"], old.get("impact"),
+                           "published")
+        return jsonify(db.get_scenario(sid))
+
+    @app.delete("/api/scenarios/<int:sid>")
+    def api_scenario_delete(sid: int):
+        db.delete_scenario(sid)
+        return jsonify({"ok": True})
+
+    @app.post("/api/scenarios/<int:sid>/diff-text")
+    def api_scenario_diff_text(sid: int):
+        """已保存版本的差异说明（Markdown 文本），供导出。"""
+        old = db.get_scenario(sid)
+        if not old:
+            abort(404)
+        plan = db.get_plan(old["planId"])
+        ev = evaluate_scenario(plan["data"], old["scenario"])
+        return jsonify({
+            "markdown": "\n".join(impact_text_lines(ev)),
+            "impact": ev["impact"],
+        })
 
     # -- 错误 ----------------------------------------------------------------
 

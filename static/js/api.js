@@ -40,5 +40,21 @@ const Api = (() => {
       req(`/api/plans/${pid}/snapshots`, { method: "POST", body: JSON.stringify({ name }) }),
     deleteSnapshot: (sid) => req(`/api/snapshots/${sid}`, { method: "DELETE" }),
     compare: (pid, ids) => req(`/api/plans/${pid}/compare?ids=${ids.join(",")}`),
+
+    // 路线变更推演
+    evaluateWhatif: (data, scenario) =>
+      req("/api/whatif/evaluate", {
+        method: "POST",
+        body: JSON.stringify({ data, scenario }),
+      }),
+    listScenarios: (pid) => req(`/api/plans/${pid}/scenarios`),
+    createScenario: (pid, payload) =>
+      req(`/api/plans/${pid}/scenarios`, { method: "POST", body: JSON.stringify(payload) }),
+    getScenario: (sid) => req(`/api/scenarios/${sid}`),
+    updateScenario: (sid, payload) =>
+      req(`/api/scenarios/${sid}`, { method: "PUT", body: JSON.stringify(payload) }),
+    publishScenario: (sid) =>
+      req(`/api/scenarios/${sid}/publish`, { method: "POST" }),
+    deleteScenario: (sid) => req(`/api/scenarios/${sid}`, { method: "DELETE" }),
   };
 })();
